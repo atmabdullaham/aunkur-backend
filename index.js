@@ -64,7 +64,6 @@ async function run() {
 
     // jwt related apis
     app.post('/jwt', async(req,res)=>{
-     
       const user = req.body;
       const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET,{
         expiresIn: '1h' // Token will expire in 1 hour
@@ -86,7 +85,18 @@ async function run() {
         req.decoded = decoded;
         next()
       })
-      
+    }
+
+    // Middleware to verify admin role
+    const verifyAdmin = async (req, res, next)=>{
+      const email = req.decoded.email;
+      const query = {email: email}
+      const user = await userCollection.findOne(query);
+      const isAdmin = user?.role === "admin";
+      if(!isAdmin){
+        return res.status(403).send({message: "Forbidden Access"})
+      }
+      next()
     }
 
 // Routes
@@ -121,7 +131,7 @@ app.post('/user', async(req,res)=>{
   res.send(result)
 })
 
-app.get("/users", verifyToken, async(req, res)=>{
+app.get("/users", verifyToken, verifyAdmin, async(req, res)=>{
   
   const result = await userCollection.find().toArray()
   res.send(result)
