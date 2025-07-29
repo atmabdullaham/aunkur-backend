@@ -27,7 +27,7 @@ class paymentController {
             },{
            headers: await this.bkash_headers()
             })
-            console.log(data)
+            // console.log(data)
             return res.status(200).json({bkashURL: data.bkashURL})
         } catch (error) {
             return res.status(401).json({error: error.message})
@@ -53,14 +53,14 @@ class paymentController {
                     //     date: data.paymentExecuteTime,
                     //     amount: parseInt(data.amount)
                     // })
-                    console.log(data)
+                    // console.log(data)
 
                     return res.redirect(`http://localhost:5173/success`)
                 }else{
                     return res.redirect(`http://localhost:5173/error?message=${data.statusMessage}`)
                 }
             } catch (error) {
-                console.log(error)
+                // console.log(error)
                 return res.redirect(`http://localhost:5173/error?message=${error.message}`)
             }
     }
