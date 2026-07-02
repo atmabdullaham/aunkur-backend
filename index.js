@@ -17,8 +17,14 @@ const port = process.env.PORT || 5000;
 // Middleware
 
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:5174', 'https://aunkurctgnorth.org'], // Add all frontend origins you use
-}))
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://aunkurctgnorth.org',
+    'https://www.aunkurctgnorth.org' // ✅ add this line
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
+}));
 app.use(
   helmet.contentSecurityPolicy({
     directives: {
@@ -30,6 +36,11 @@ app.use(
         "https://bam.nr-data.net",
         "https://payment.bkash.com", // <-- Add this
         "'unsafe-inline'", // optional, but required for some payment scripts
+      ],
+      connectSrc: [
+        "'self'",
+        "https://aunkurctgnorth.org",
+        "https://www.aunkurctgnorth.org"
       ],
       objectSrc: ["'none'"],
       upgradeInsecureRequests: [],
@@ -61,6 +72,7 @@ async function run() {
     const database = client.db("aunkurDB");
     const applicationCollection = database.collection("applications");
     const userCollection = database.collection("users");
+    const runCollection = database.collection("run")
 
 
 
@@ -105,6 +117,7 @@ app.get('/', (req, res)=>{
     res.send("Hello Aunkur!")
 })
 
+
 app.get("/applications", async(req, res)=>{
   const email = req.query.email;
   const query = {email: email}
@@ -131,31 +144,126 @@ const sendBulkSMS = async (numbersArray, message) => {
   }
 };
 
-// aplication collection and send sms after successfull saved
+// Admin message via telegram
+const botToken  = process.env.TELEGRAM_BOT_TOKEN;
+const groupChatId  = process.env.TELEGRAM_GROUP_CHAT_ID;
+
+// Function to send Telegram message
+const sendTelegramMessage = async (message) => {
+const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+try {
+    await axios.post(url, {
+      chat_id: groupChatId.trim(),
+      text: message,
+    });
+    console.log("✅ Telegram message sent to admin.");
+  } catch (error) {
+    console.error("❌ Failed to send Telegram message:", error.response?.data || error);
+  
+  }  
+};
+
+
+
+
+// $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+// run with shibir related apis
+
+const SERIAL_RANGES = {
+  L:   { start: 1,    end: 500 },
+  M:   { start: 501,  end: 750 },
+  XL:  { start: 751,  end: 1150 },
+  XXL: { start: 1151, end: 1300 },
+  XXXL:{ start: 1301, end: 1350 }
+};
+// _________________________________
+// get all applications
+app.get("/run", async (req, res) => {
+  try {
+    let {
+      limit = 10,
+      skip = 0,
+      sort = "Timestamp",
+      order = "desc",
+      search = "",
+      applicationStatus = ""
+    } = req.query;
+
+    limit = Number(limit);
+    skip = Number(skip);
+
+    let query = {};
+
+    if (applicationStatus) {
+      query.registrationStatus = applicationStatus;
+    }
+
+    if (search) {
+      query.$or = [
+        { fullName: { $regex: search, $options: "i" } },
+        { institutionName: { $regex: search, $options: "i" } },
+        { mobileNumber: { $regex: search, $options: "i" } }
+      ];
+    }
+
+    const sortOption = {};
+    sortOption[sort] = order === "asc" ? 1 : -1;
+
+    const data = await runCollection
+      .find(query)
+      .sort(sortOption)
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    const total = await runCollection.countDocuments(query);
+
+    res.send({
+      success: true,
+      data,
+      total,
+      totalPage: Math.ceil(total / limit)
+    });
+  } catch (error) {
+    res.status(500).send({ error: "Server error" });
+  }
+});
+
+
+
+// 
 app.post('/applications', async(req, res)=>{
   const application = req.body;
   const result = await applicationCollection.insertOne(application)
   if (result.acknowledged && result.insertedId) {
-      const id = result.insertedId
-      const filter = { _id: new ObjectId(id) };
+      
 
     // ✅ Fetch user info (to get phone number)
-    const newRegistration = await applicationCollection.findOne(filter);
-    const phone = newRegistration?.phone_number; // Assuming you store phone number in bkash_number
+   const phone = application?.phone_number?.trim() || "";
+      const name = application?.name_en?.trim() || "";
+      const lastName = name.split(" ").slice(-1)[0] || "";
+      const bkash = application?.bkash_number || "";
+      const tnxId = application?.transaction_Id || "";
+      const syllabusLink = "aunkurctgnorth.org/syllabus";
 
     // ✅ Send confirmation SMS
-const message = `Dear ${newRegistration.name_en}, congratulations! We have received your registration. You will receive a confirmation SMS within 24 hours. Aunkur Scholarship 2025.
-`;
+const message = `Dear ${lastName}, your registration is received. You'll receive confirmation in 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'25`;
 
     try {
       await sendBulkSMS([phone], message);
     } catch (smsError) {
       console.error("❌ Failed to send SMS:", smsError.message);
     }
+    const telegramText = `📥 New Registration\n👤Name: ${name}\n📱 Phone: ${phone}\n💳 Bkash: ${bkash}\n🧾 Txn ID: ${tnxId}`;
+    try{
+    await sendTelegramMessage(telegramText);
+
+    } catch(error){
+      console.error("failed to send admin sms", smsError.message)
+    }
   }
   res.send(result)
 })
-
 
 
 
@@ -172,11 +280,17 @@ app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
     // ✅ Fetch user info (to get phone number)
     const updatedUser = await applicationCollection.findOne(filter);
     const phone = updatedUser?.phone_number; // Assuming you store phone number in bkash_number
+    const name = updatedUser.name_en;
+    const lastName = name?.trim()?.split(" ").slice(-1)[0] || "";
 
     // ✅ Send confirmation SMS
-    const message = `Dear ${updatedUser.name_en}, your registration is ${status}. 
-    Thank you! 
-    Aunkur Scholarship 2025`;
+    let message = "";
+
+if (updatedUser.reg_status === "accepted") {
+  message = `Congratulations! Dear ${lastName}, your Aunkur Scholarship 2025 registration is accepted. Thank you for joining us.\nAunkur Scholarship Project'25`;
+} else if (updatedUser.reg_status === "rejected") {
+  message = `Dear ${lastName}, your registration was not accepted. If paid, please contact +8801879891623. Thank you.\nAunkur Scholarship Project'25`;
+} 
     try {
       await sendBulkSMS([phone], message);
     } catch (smsError) {
@@ -200,6 +314,49 @@ app.get('/registrations',verifyToken,verifyAdmin, async(req, res)=>{
   const result = await applicationCollection.find().toArray()
   res.send(result)
 })
+
+app.get('/registrations/search', async (req, res) => {
+  try {
+    let { phone } = req.query;
+
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "Phone number is required" });
+    }
+
+    // Clean the input (remove spaces, trim)
+    phone = phone.replace(/\s+/g, "").trim();
+
+    // Create regex that ignores spaces inside stored phone_number
+    const regex = new RegExp(`^\\s*${phone.split("").join("\\s*")}\\s*$`);
+
+    // Find all registrations that match this regex
+    const registrations = await applicationCollection
+      .find({ phone_number: { $regex: regex } })
+      .toArray();
+
+    if (!registrations.length) {
+      return res.status(404).json({ success: false, message: "No registration found" });
+    }
+
+    res.json({ success: true, data: registrations });
+  } catch (error) {
+    console.error("❌ Error searching registration:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+
+
+
+
+app.get('/registration-details/:id', async(req, res)=>{
+  const id = req.params.id;
+  const filter = {_id: new ObjectId(id)};
+  const result = await applicationCollection.findOne(filter)
+  res.send(result)
+
+})
+
 
 // user collection
 app.post('/user', async(req,res)=>{
@@ -267,6 +424,9 @@ app.get('/users/admin/:email', verifyToken, async(req, res)=>{
     // Ensures that the client will close when you finish/error
     // await client.close();
   }
+  app.listen(port, ()=>{
+    console.log(`Server is running on port ${port}`);
+})
 }
 run().catch(console.dir);
 
@@ -281,6 +441,3 @@ run().catch(console.dir);
 
 
 
-app.listen(port, ()=>{
-    console.log(`Server is running on port ${port}`);
-})
