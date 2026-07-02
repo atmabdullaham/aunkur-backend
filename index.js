@@ -54,7 +54,8 @@ app.use('/api', require('./routes/routes'))
 
 
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.cs9shgv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+// const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.cs9shgv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+const uri = `mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-yg6fc4o-shard-00-00.cs9shgv.mongodb.net:27017,ac-yg6fc4o-shard-00-01.cs9shgv.mongodb.net:27017,ac-yg6fc4o-shard-00-02.cs9shgv.mongodb.net:27017/?ssl=true&replicaSet=atlas-r1j3dw-shard-0&authSource=admin&retryWrites=true&w=majority&appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -72,7 +73,33 @@ async function run() {
     const database = client.db("aunkurDB");
     const applicationCollection = database.collection("applications");
     const userCollection = database.collection("users");
-    const runCollection = database.collection("run")
+    const settingsCollection = database.collection("settings");
+    // const runCollection = database.collection("run")
+
+    // Helper: get or create the single settings document
+    const getSettings = async () => {
+      let settings = await settingsCollection.findOne({});
+      if (!settings) {
+        const defaultSettings = {
+          registrationEnabled: false,
+          enrollmentTimerStart: null,
+          enrollmentTimerEnd: null,
+          syllabus: [
+            { classId: "4", title: "৪র্থ শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1kvhzTl9peucxY9Nz2s0PaQijR8vnSR04/view", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1kvhzTl9peucxY9Nz2s0PaQijR8vnSR04&export=download", upcoming: false },
+            { classId: "5", title: "৫ম শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1eHxJmQa6sFP5s8LXSbaNeTOfPZvfepeJ/view?usp=sharing", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1eHxJmQa6sFP5s8LXSbaNeTOfPZvfepeJ&export=download", upcoming: false },
+            { classId: "6", title: "৬ষ্ঠ শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1-xEJXyd4EN_DxsClbVXbTHOUxzP4RVpp/view?usp=sharing", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1-xEJXyd4EN_DxsClbVXbTHOUxzP4RVpp&export=download", upcoming: false },
+            { classId: "7", title: "৭ম শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1Tm8ozD0bCtBiuHzfnwDfGGgr9WScQGdE/view?usp=sharing", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1Tm8ozD0bCtBiuHzfnwDfGGgr9WScQGdE&export=download", upcoming: false },
+            { classId: "8", title: "৮ম শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1VzUDNC9O5ODV0ZNlpVN7-oM8rHvSIlbu/view?usp=sharing", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1VzUDNC9O5ODV0ZNlpVN7-oM8rHvSIlbu&export=download", upcoming: false },
+            { classId: "9", title: "৯ম শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1alrqvdzcF9Swlmd4sAEHMAFjifQX7ZwS/view?usp=sharing", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1alrqvdzcF9Swlmd4sAEHMAFjifQX7ZwS&export=download", upcoming: false },
+            { classId: "10", title: "১০ শ্রেণির সিলেবাস", subjects: ["বাংলা", "বিজ্ঞান", "গণিত", "ইংরেজি"], viewLink: "https://drive.google.com/file/d/1wO4V8nCI58AKpooTSZ0O_wqA6EwiBPEr/view?usp=sharing", downloadLink: "https://drive.usercontent.google.com/u/0/uc?id=1wO4V8nCI58AKpooTSZ0O_wqA6EwiBPEr&export=download", upcoming: false },
+            { classId: "upcoming", title: "", subjects: [], viewLink: "", downloadLink: "", upcoming: true }
+          ]
+        };
+        await settingsCollection.insertOne(defaultSettings);
+        return defaultSettings;
+      }
+      return settings;
+    };
 
 
 
@@ -166,6 +193,7 @@ try {
 
 
 
+/*
 // $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 // run with shibir related apis
 
@@ -228,11 +256,122 @@ app.get("/run", async (req, res) => {
     res.status(500).send({ error: "Server error" });
   }
 });
+*/
 
 
+
+// =============================================
+// Settings APIs
+// =============================================
+
+// GET /settings — public, returns registration state + timer
+app.get('/settings', async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const { registrationEnabled, enrollmentTimerStart, enrollmentTimerEnd } = settings;
+    res.send({ registrationEnabled, enrollmentTimerStart, enrollmentTimerEnd });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to fetch settings" });
+  }
+});
+
+// PATCH /settings/registration — admin only, toggle registration on/off
+app.patch('/settings/registration', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { registrationEnabled } = req.body;
+    await settingsCollection.updateOne(
+      {},
+      { $set: { registrationEnabled: Boolean(registrationEnabled) } },
+      { upsert: true }
+    );
+    res.send({ success: true, registrationEnabled: Boolean(registrationEnabled) });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to update registration status" });
+  }
+});
+
+// PATCH /settings/timer — admin only, set enrollment timer
+app.patch('/settings/timer', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { enrollmentTimerStart, enrollmentTimerEnd } = req.body;
+    await settingsCollection.updateOne(
+      {},
+      { $set: { enrollmentTimerStart, enrollmentTimerEnd } },
+      { upsert: true }
+    );
+    res.send({ success: true, enrollmentTimerStart, enrollmentTimerEnd });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to update timer" });
+  }
+});
+
+// GET /settings/syllabus — public, returns syllabus array
+app.get('/settings/syllabus', async (req, res) => {
+  try {
+    const settings = await getSettings();
+    res.send({ syllabus: settings.syllabus || [] });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to fetch syllabus" });
+  }
+});
+
+// PUT /settings/syllabus — admin only, replace entire syllabus array
+app.put('/settings/syllabus', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { syllabus } = req.body;
+    await settingsCollection.updateOne(
+      {},
+      { $set: { syllabus } },
+      { upsert: true }
+    );
+    res.send({ success: true });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to update syllabus" });
+  }
+});
+
+// PATCH /settings/syllabus/:index — admin only, update single class entry
+app.patch('/settings/syllabus/:index', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const idx = parseInt(req.params.index);
+    const updatedEntry = req.body;
+    const settings = await getSettings();
+    const syllabus = settings.syllabus || [];
+    if (idx < 0 || idx >= syllabus.length) {
+      return res.status(400).send({ message: "Invalid syllabus index" });
+    }
+    syllabus[idx] = { ...syllabus[idx], ...updatedEntry };
+    await settingsCollection.updateOne(
+      {},
+      { $set: { syllabus } },
+      { upsert: true }
+    );
+    res.send({ success: true, entry: syllabus[idx] });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to update syllabus entry" });
+  }
+});
+
+// =============================================
+// Applications
+// =============================================
 
 // 
 app.post('/applications', async(req, res)=>{
+  // ✅ Guard: Check if registration is currently open
+  try {
+    const settings = await getSettings();
+    const now = new Date();
+    const timerEnd = settings.enrollmentTimerEnd ? new Date(settings.enrollmentTimerEnd) : null;
+    const timerExpired = timerEnd && now > timerEnd;
+
+    if (!settings.registrationEnabled || timerExpired) {
+      return res.status(403).send({ message: "Registration is currently closed" });
+    }
+  } catch (err) {
+    return res.status(500).send({ message: "Server error checking settings" });
+  }
+
   const application = req.body;
   const result = await applicationCollection.insertOne(application)
   if (result.acknowledged && result.insertedId) {
@@ -259,7 +398,7 @@ const message = `Dear ${lastName}, your registration is received. You'll receive
     await sendTelegramMessage(telegramText);
 
     } catch(error){
-      console.error("failed to send admin sms", smsError.message)
+      console.error("failed to send admin sms", error.message)
     }
   }
   res.send(result)
