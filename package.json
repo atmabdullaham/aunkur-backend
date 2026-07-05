@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@imagekit/nodejs": "^7.9.1",
     "axios": "^1.11.0",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",

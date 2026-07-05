@@ -1,7 +1,10 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const helmet = require("helmet");
+require("dotenv").config();
 const jwt = require('jsonwebtoken');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const ImageKit = require("@imagekit/nodejs");
 
 
 
@@ -53,7 +56,28 @@ app.use('/api', require('./routes/routes'))
 
 
 
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+
+// --- ImageKit Client ---
+const imgkitClient = new ImageKit({
+  privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+  publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+  urlEndpoint: process.env.PUBLICURL,
+});
+
+app.get("/auth", function (req, res) {
+  // Your application logic to authenticate the user
+  // For example, you can check if the user is logged in or has the necessary permissions
+  // If the user is not authenticated, you can return an error response
+  const { token, expire, signature } =
+    imgkitClient.helper.getAuthenticationParameters();
+  res.send({
+    token,
+    expire,
+    signature,
+    publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+  });
+});
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.cs9shgv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -73,27 +97,27 @@ async function run() {
     const applicationCollection = database.collection("applications");
     const userCollection = database.collection("users");
     const runCollection = database.collection("run")
-
+    const settingsCollection = database.collection("settings")
 
 
     // jwt related apis
-    app.post('/jwt', async(req,res)=>{
+    app.post('/jwt', async (req, res) => {
       const user = req.body;
-      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET,{
+      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
         expiresIn: '5h' // Token will expire in 5 hour
       })
-      res.send({token})
+      res.send({ token })
     })
 
     // Middleware to verify JWT
     const verifyToken = (req, res, next) => {
-      if(!req.headers.authorization) {
-        return res.status(401).send({message: "Unauthorized access"})
+      if (!req.headers.authorization) {
+        return res.status(401).send({ message: "Unauthorized access" })
       }
       const token = req.headers.authorization.split(' ')[1];
-      jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded)=>{
-        if(err){
-          return res.status(401).send({message: "Unauthorized access"})
+      jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+        if (err) {
+          return res.status(401).send({ message: "Unauthorized access" })
         }
         req.decoded = decoded;
         next()
@@ -101,314 +125,352 @@ async function run() {
     }
 
     // Middleware to verify admin role
-    const verifyAdmin = async (req, res, next)=>{
+    const verifyAdmin = async (req, res, next) => {
       const email = req.decoded.email;
-      const query = {email: email}
+      const query = { email: email }
       const user = await userCollection.findOne(query);
       const isAdmin = user?.role === "admin";
-      if(!isAdmin){
-        return res.status(403).send({message: "Forbidden Access"})
+      if (!isAdmin) {
+        return res.status(403).send({ message: "Forbidden Access" })
       }
       next()
     }
 
-// Routes
-app.get('/', (req, res)=>{
-    res.send("Hello Aunkur!")
-})
+    // ─── Syllabus Settings API ───────────────────────────────────────
 
-
-app.get("/applications", async(req, res)=>{
-  const email = req.query.email;
-  const query = {email: email}
-  const result = await applicationCollection.find(query).toArray()
-  res.send(result)
-})
-
-// sms 
-const sendBulkSMS = async (numbersArray, message) => {
-  const smsData = {
-    api_key: process.env.BULKSMS_API_KEY,          // replace with your actual API key
-    senderid: process.env.BULKSMS_SENDERID,       // replace with your approved sender ID
-    number: numbersArray.join(","),   // example: ['88016xxxxxxx','88019xxxxxxx']
-    message: message,
-  };
-
-  try {
-    const response = await axios.post("http://bulksmsbd.net/api/smsapi", smsData);
-    console.log("✅ SMS sent successfully:", response.data);
-    return response.data;
-  } catch (error) {
-    console.error("❌ SMS sending failed:", error.response?.data || error.message);
-    throw error;
-  }
-};
-
-// Admin message via telegram
-const botToken  = process.env.TELEGRAM_BOT_TOKEN;
-const groupChatId  = process.env.TELEGRAM_GROUP_CHAT_ID;
-
-// Function to send Telegram message
-const sendTelegramMessage = async (message) => {
-const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-try {
-    await axios.post(url, {
-      chat_id: groupChatId.trim(),
-      text: message,
+    // GET /settings/syllabus — fetch the syllabus array
+    app.get('/settings/syllabus', async (req, res) => {
+      try {
+        const doc = await settingsCollection.findOne({ type: 'syllabus' });
+        res.send({ syllabus: doc?.syllabus || [] });
+      } catch (error) {
+        console.error("Error fetching syllabus:", error);
+        res.status(500).send({ message: "Failed to fetch syllabus settings" });
+      }
     });
-    console.log("✅ Telegram message sent to admin.");
-  } catch (error) {
-    console.error("❌ Failed to send Telegram message:", error.response?.data || error);
-  
-  }  
-};
 
+    // PATCH /settings/syllabus/:index — update a specific syllabus entry by index
+    app.patch('/settings/syllabus/:index', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const index = parseInt(req.params.index);
+        const entry = req.body;
 
+        // Build the update using positional key
+        const updateFields = {};
+        for (const [key, value] of Object.entries(entry)) {
+          updateFields[`syllabus.${index}.${key}`] = value;
+        }
 
+        const result = await settingsCollection.updateOne(
+          { type: 'syllabus' },
+          { $set: updateFields },
+          { upsert: true }
+        );
 
-// $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-// run with shibir related apis
-
-const SERIAL_RANGES = {
-  L:   { start: 1,    end: 500 },
-  M:   { start: 501,  end: 750 },
-  XL:  { start: 751,  end: 1150 },
-  XXL: { start: 1151, end: 1300 },
-  XXXL:{ start: 1301, end: 1350 }
-};
-// _________________________________
-// get all applications
-app.get("/run", async (req, res) => {
-  try {
-    let {
-      limit = 10,
-      skip = 0,
-      sort = "Timestamp",
-      order = "desc",
-      search = "",
-      applicationStatus = ""
-    } = req.query;
-
-    limit = Number(limit);
-    skip = Number(skip);
-
-    let query = {};
-
-    if (applicationStatus) {
-      query.registrationStatus = applicationStatus;
-    }
-
-    if (search) {
-      query.$or = [
-        { fullName: { $regex: search, $options: "i" } },
-        { institutionName: { $regex: search, $options: "i" } },
-        { mobileNumber: { $regex: search, $options: "i" } }
-      ];
-    }
-
-    const sortOption = {};
-    sortOption[sort] = order === "asc" ? 1 : -1;
-
-    const data = await runCollection
-      .find(query)
-      .sort(sortOption)
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await runCollection.countDocuments(query);
-
-    res.send({
-      success: true,
-      data,
-      total,
-      totalPage: Math.ceil(total / limit)
+        res.send({ success: true, result });
+      } catch (error) {
+        console.error("Error updating syllabus:", error);
+        res.status(500).send({ message: "Failed to update syllabus entry" });
+      }
     });
-  } catch (error) {
-    res.status(500).send({ error: "Server error" });
-  }
-});
+
+    // Routes
+    app.get('/', (req, res) => {
+      res.send("Hello Aunkur!")
+    })
 
 
+    app.get("/applications", async (req, res) => {
+      const email = req.query.email;
+      const query = { email: email }
+      const result = await applicationCollection.find(query).toArray()
+      res.send(result)
+    })
 
-// 
-app.post('/applications', async(req, res)=>{
-  const application = req.body;
-  const result = await applicationCollection.insertOne(application)
-  if (result.acknowledged && result.insertedId) {
-      
+    // sms 
+    const sendBulkSMS = async (numbersArray, message) => {
+      const smsData = {
+        api_key: process.env.BULKSMS_API_KEY,          // replace with your actual API key
+        senderid: process.env.BULKSMS_SENDERID,       // replace with your approved sender ID
+        number: numbersArray.join(","),   // example: ['88016xxxxxxx','88019xxxxxxx']
+        message: message,
+      };
 
-    // ✅ Fetch user info (to get phone number)
-   const phone = application?.phone_number?.trim() || "";
-      const name = application?.name_en?.trim() || "";
-      const lastName = name.split(" ").slice(-1)[0] || "";
-      const bkash = application?.bkash_number || "";
-      const tnxId = application?.transaction_Id || "";
-      const syllabusLink = "aunkurctgnorth.org/syllabus";
+      try {
+        const response = await axios.post("http://bulksmsbd.net/api/smsapi", smsData);
+        console.log("✅ SMS sent successfully:", response.data);
+        return response.data;
+      } catch (error) {
+        console.error("❌ SMS sending failed:", error.response?.data || error.message);
+        throw error;
+      }
+    };
 
-    // ✅ Send confirmation SMS
-const message = `Dear ${lastName}, your registration is received. You'll receive confirmation in 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'25`;
+    // Admin message via telegram
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    const groupChatId = process.env.TELEGRAM_GROUP_CHAT_ID;
 
-    try {
-      await sendBulkSMS([phone], message);
-    } catch (smsError) {
-      console.error("❌ Failed to send SMS:", smsError.message);
-    }
-    const telegramText = `📥 New Registration\n👤Name: ${name}\n📱 Phone: ${phone}\n💳 Bkash: ${bkash}\n🧾 Txn ID: ${tnxId}`;
-    try{
-    await sendTelegramMessage(telegramText);
+    // Function to send Telegram message
+    const sendTelegramMessage = async (message) => {
+      const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+      try {
+        await axios.post(url, {
+          chat_id: groupChatId.trim(),
+          text: message,
+        });
+        console.log("✅ Telegram message sent to admin.");
+      } catch (error) {
+        console.error("❌ Failed to send Telegram message:", error.response?.data || error);
 
-    } catch(error){
-      console.error("failed to send admin sms", smsError.message)
-    }
-  }
-  res.send(result)
-})
-
-
-
-app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
-  const id = req.params.id;
-  const { status } = req.body;
-
-  const filter = { _id: new ObjectId(id) };
-  const updateDoc = { $set: { reg_status: status } };
-
-  const result = await applicationCollection.updateOne(filter, updateDoc);
-
-  if (result.modifiedCount > 0) {
-    // ✅ Fetch user info (to get phone number)
-    const updatedUser = await applicationCollection.findOne(filter);
-    const phone = updatedUser?.phone_number; // Assuming you store phone number in bkash_number
-    const name = updatedUser.name_en;
-    const lastName = name?.trim()?.split(" ").slice(-1)[0] || "";
-
-    // ✅ Send confirmation SMS
-    let message = "";
-
-if (updatedUser.reg_status === "accepted") {
-  message = `Congratulations! Dear ${lastName}, your Aunkur Scholarship 2025 registration is accepted. Thank you for joining us.\nAunkur Scholarship Project'25`;
-} else if (updatedUser.reg_status === "rejected") {
-  message = `Dear ${lastName}, your registration was not accepted. If paid, please contact +8801879891623. Thank you.\nAunkur Scholarship Project'25`;
-} 
-    try {
-      await sendBulkSMS([phone], message);
-    } catch (smsError) {
-      console.error("❌ Failed to send SMS:", smsError.message);
-    }
-  }
-
-  res.send(result);
-});
-
-
-app.delete('/applications/:id',verifyToken,verifyAdmin, async(req, res)=>{
-    const id = req.params.id;
-    const filter = {_id: new ObjectId(id)}
-    const result = await applicationCollection.deleteOne(filter)
-    res.send(result)
-
-})
-
-app.get('/registrations',verifyToken,verifyAdmin, async(req, res)=>{
-  const result = await applicationCollection.find().toArray()
-  res.send(result)
-})
-
-app.get('/registrations/search', async (req, res) => {
-  try {
-    let { phone } = req.query;
-
-    if (!phone) {
-      return res.status(400).json({ success: false, message: "Phone number is required" });
-    }
-
-    // Clean the input (remove spaces, trim)
-    phone = phone.replace(/\s+/g, "").trim();
-
-    // Create regex that ignores spaces inside stored phone_number
-    const regex = new RegExp(`^\\s*${phone.split("").join("\\s*")}\\s*$`);
-
-    // Find all registrations that match this regex
-    const registrations = await applicationCollection
-      .find({ phone_number: { $regex: regex } })
-      .toArray();
-
-    if (!registrations.length) {
-      return res.status(404).json({ success: false, message: "No registration found" });
-    }
-
-    res.json({ success: true, data: registrations });
-  } catch (error) {
-    console.error("❌ Error searching registration:", error);
-    res.status(500).json({ success: false, message: "Server error" });
-  }
-});
+      }
+    };
 
 
 
 
+    // $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+    // run with shibir related apis
 
-app.get('/registration-details/:id', async(req, res)=>{
-  const id = req.params.id;
-  const filter = {_id: new ObjectId(id)};
-  const result = await applicationCollection.findOne(filter)
-  res.send(result)
+    const SERIAL_RANGES = {
+      L: { start: 1, end: 500 },
+      M: { start: 501, end: 750 },
+      XL: { start: 751, end: 1150 },
+      XXL: { start: 1151, end: 1300 },
+      XXXL: { start: 1301, end: 1350 }
+    };
+    // _________________________________
+    // get all applications
+    app.get("/run", async (req, res) => {
+      try {
+        let {
+          limit = 10,
+          skip = 0,
+          sort = "Timestamp",
+          order = "desc",
+          search = "",
+          applicationStatus = ""
+        } = req.query;
 
-})
+        limit = Number(limit);
+        skip = Number(skip);
+
+        let query = {};
+
+        if (applicationStatus) {
+          query.registrationStatus = applicationStatus;
+        }
+
+        if (search) {
+          query.$or = [
+            { fullName: { $regex: search, $options: "i" } },
+            { institutionName: { $regex: search, $options: "i" } },
+            { mobileNumber: { $regex: search, $options: "i" } }
+          ];
+        }
+
+        const sortOption = {};
+        sortOption[sort] = order === "asc" ? 1 : -1;
+
+        const data = await runCollection
+          .find(query)
+          .sort(sortOption)
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const total = await runCollection.countDocuments(query);
+
+        res.send({
+          success: true,
+          data,
+          total,
+          totalPage: Math.ceil(total / limit)
+        });
+      } catch (error) {
+        res.status(500).send({ error: "Server error" });
+      }
+    });
 
 
-// user collection
-app.post('/user', async(req,res)=>{
-  const user = req.body;
-  const query = {email: user.email}
-  const existingUser = await userCollection.findOne(query)
-  if(existingUser){
-    return res.send({message:"User already esists"})
-  }
-  const result = await userCollection.insertOne(user)
-  res.send(result)
-})
 
-app.get("/users", verifyToken, verifyAdmin, async(req, res)=>{
-  
-  const result = await userCollection.find().toArray()
-  res.send(result)
-})
+    // 
+    app.post('/applications', async (req, res) => {
+      const application = req.body;
+      const result = await applicationCollection.insertOne(application)
+      if (result.acknowledged && result.insertedId) {
 
-app.delete('/users/:id', verifyToken, verifyAdmin, async(req, res)=>{  
-const id = req.params.id;
-const query = {_id: new ObjectId(id)}
-const result = await userCollection.deleteOne(query)
-res.send(result)
-})
 
-app.patch('/users/:id', verifyToken, verifyAdmin, async(req, res)=>{
-  const id = req.params.id;
-  const filter = {_id: new ObjectId(id)}
-  const updatedDoc = {
-    $set: {
-      role: "admin"
-    },
-  };
-  const result = await userCollection.updateOne(filter, updatedDoc)
-  res.send(result)
+        // ✅ Fetch user info (to get phone number)
+        const phone = application?.phone_number?.trim() || "";
+        const name = application?.name_en?.trim() || "";
+        const lastName = name.split(" ").slice(-1)[0] || "";
+        const bkash = application?.bkash_number || "";
+        const tnxId = application?.transaction_Id || "";
+        const syllabusLink = "aunkurctgnorth.org/syllabus";
 
-})
+        // ✅ Send confirmation SMS
+        const message = `Dear ${lastName}, your registration is received. You'll receive confirmation in 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'25`;
 
-app.get('/users/admin/:email', verifyToken, async(req, res)=>{
- const email = req.params.email;
- if(email !== req.decoded.email){
-  return res.status(403).send({message: "Forbidden access"})
- }
- const query = {email: email};
- const user = await userCollection.findOne(query);
- let admin = false;
- if(user){
-  admin = user?.role === 'admin'
- }
- res.send({admin})
-})
+        try {
+          await sendBulkSMS([phone], message);
+        } catch (smsError) {
+          console.error("❌ Failed to send SMS:", smsError.message);
+        }
+        const telegramText = `📥 New Registration\n👤Name: ${name}\n📱 Phone: ${phone}\n💳 Bkash: ${bkash}\n🧾 Txn ID: ${tnxId}`;
+        try {
+          await sendTelegramMessage(telegramText);
+
+        } catch (error) {
+          console.error("failed to send admin sms", smsError.message)
+        }
+      }
+      res.send(result)
+    })
+
+
+
+    app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body;
+
+      const filter = { _id: new ObjectId(id) };
+      const updateDoc = { $set: { reg_status: status } };
+
+      const result = await applicationCollection.updateOne(filter, updateDoc);
+
+      if (result.modifiedCount > 0) {
+        // ✅ Fetch user info (to get phone number)
+        const updatedUser = await applicationCollection.findOne(filter);
+        const phone = updatedUser?.phone_number; // Assuming you store phone number in bkash_number
+        const name = updatedUser.name_en;
+        const lastName = name?.trim()?.split(" ").slice(-1)[0] || "";
+
+        // ✅ Send confirmation SMS
+        let message = "";
+
+        if (updatedUser.reg_status === "accepted") {
+          message = `Congratulations! Dear ${lastName}, your Aunkur Scholarship 2025 registration is accepted. Thank you for joining us.\nAunkur Scholarship Project'25`;
+        } else if (updatedUser.reg_status === "rejected") {
+          message = `Dear ${lastName}, your registration was not accepted. If paid, please contact +8801879891623. Thank you.\nAunkur Scholarship Project'25`;
+        }
+        try {
+          await sendBulkSMS([phone], message);
+        } catch (smsError) {
+          console.error("❌ Failed to send SMS:", smsError.message);
+        }
+      }
+
+      res.send(result);
+    });
+
+
+    app.delete('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const filter = { _id: new ObjectId(id) }
+      const result = await applicationCollection.deleteOne(filter)
+      res.send(result)
+
+    })
+
+    app.get('/registrations', verifyToken, verifyAdmin, async (req, res) => {
+      const result = await applicationCollection.find().toArray()
+      res.send(result)
+    })
+
+    app.get('/registrations/search', async (req, res) => {
+      try {
+        let { phone } = req.query;
+
+        if (!phone) {
+          return res.status(400).json({ success: false, message: "Phone number is required" });
+        }
+
+        // Clean the input (remove spaces, trim)
+        phone = phone.replace(/\s+/g, "").trim();
+
+        // Create regex that ignores spaces inside stored phone_number
+        const regex = new RegExp(`^\\s*${phone.split("").join("\\s*")}\\s*$`);
+
+        // Find all registrations that match this regex
+        const registrations = await applicationCollection
+          .find({ phone_number: { $regex: regex } })
+          .toArray();
+
+        if (!registrations.length) {
+          return res.status(404).json({ success: false, message: "No registration found" });
+        }
+
+        res.json({ success: true, data: registrations });
+      } catch (error) {
+        console.error("❌ Error searching registration:", error);
+        res.status(500).json({ success: false, message: "Server error" });
+      }
+    });
+
+
+
+
+
+    app.get('/registration-details/:id', async (req, res) => {
+      const id = req.params.id;
+      const filter = { _id: new ObjectId(id) };
+      const result = await applicationCollection.findOne(filter)
+      res.send(result)
+
+    })
+
+
+    // user collection
+    app.post('/user', async (req, res) => {
+      const user = req.body;
+      const query = { email: user.email }
+      const existingUser = await userCollection.findOne(query)
+      if (existingUser) {
+        return res.send({ message: "User already esists" })
+      }
+      const result = await userCollection.insertOne(user)
+      res.send(result)
+    })
+
+    app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
+
+      const result = await userCollection.find().toArray()
+      res.send(result)
+    })
+
+    app.delete('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) }
+      const result = await userCollection.deleteOne(query)
+      res.send(result)
+    })
+
+    app.patch('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const filter = { _id: new ObjectId(id) }
+      const updatedDoc = {
+        $set: {
+          role: "admin"
+        },
+      };
+      const result = await userCollection.updateOne(filter, updatedDoc)
+      res.send(result)
+
+    })
+
+    app.get('/users/admin/:email', verifyToken, async (req, res) => {
+      const email = req.params.email;
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "Forbidden access" })
+      }
+      const query = { email: email };
+      const user = await userCollection.findOne(query);
+      let admin = false;
+      if (user) {
+        admin = user?.role === 'admin'
+      }
+      res.send({ admin })
+    })
 
 
 
@@ -424,9 +486,9 @@ app.get('/users/admin/:email', verifyToken, async(req, res)=>{
     // Ensures that the client will close when you finish/error
     // await client.close();
   }
-  app.listen(port, ()=>{
+  app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
-})
+  })
 }
 run().catch(console.dir);
 
