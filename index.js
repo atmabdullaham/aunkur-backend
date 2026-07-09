@@ -99,6 +99,8 @@ async function run() {
     const applicationCollection = database.collection("applications");
     const userCollection = database.collection("users");
     const settingsCollection = database.collection("settings");
+    const noticesCollection = database.collection("notices");
+    const contactMessagesCollection = database.collection("contact_messages");
     // const runCollection = database.collection("run")
 
     // Helper: get or create the single settings document
@@ -314,6 +316,127 @@ async function run() {
     */
 
 
+
+    // =============================================
+    // Notice APIs
+    // =============================================
+
+    // GET /notices — public, returns all active notices
+    app.get('/notices', async (req, res) => {
+      try {
+        const result = await noticesCollection.find({ isActive: true }).sort({ createdAt: -1 }).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch notices" });
+      }
+    });
+
+    // GET /admin/notices — admin only, returns all notices
+    app.get('/admin/notices', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await noticesCollection.find().sort({ createdAt: -1 }).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch all notices" });
+      }
+    });
+
+    // POST /notices — admin only, create a notice
+    app.post('/notices', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { text, link, isActive } = req.body;
+        const newNotice = {
+          text,
+          link: link || "",
+          isActive: isActive !== undefined ? Boolean(isActive) : true,
+          createdAt: new Date()
+        };
+        const result = await noticesCollection.insertOne(newNotice);
+        res.send({ success: true, insertedId: result.insertedId, notice: newNotice });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to create notice" });
+      }
+    });
+
+    // PUT /notices/:id — admin only, update a notice
+    app.put('/notices/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { text, link, isActive } = req.body;
+        const filter = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: {
+            text,
+            link: link || "",
+            isActive: Boolean(isActive),
+            updatedAt: new Date()
+          }
+        };
+        const result = await noticesCollection.updateOne(filter, updateDoc);
+        res.send({ success: true, modifiedCount: result.modifiedCount });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update notice" });
+      }
+    });
+
+    // DELETE /notices/:id — admin only, delete a notice
+    app.delete('/notices/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+        const result = await noticesCollection.deleteOne(filter);
+        res.send({ success: true, deletedCount: result.deletedCount });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to delete notice" });
+      }
+    });
+
+    // =============================================
+    // Contact Submission APIs
+    // =============================================
+
+    // POST /contact — public, submit message
+    app.post('/contact', async (req, res) => {
+      try {
+        const { name, email, topic, message } = req.body;
+        if (!name || !email || !message) {
+          return res.status(400).send({ message: "Name, email, and message are required fields" });
+        }
+        const newMessage = {
+          name,
+          email,
+          topic: topic || "",
+          message,
+          submittedAt: new Date()
+        };
+        const result = await contactMessagesCollection.insertOne(newMessage);
+        res.send({ success: true, insertedId: result.insertedId });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to send message" });
+      }
+    });
+
+    // GET /contacts — admin only, list all contact submissions
+    app.get('/contacts', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await contactMessagesCollection.find().sort({ submittedAt: -1 }).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch contact submissions" });
+      }
+    });
+
+    // DELETE /contacts/:id — admin only, delete message
+    app.delete('/contacts/:id', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+        const result = await contactMessagesCollection.deleteOne(filter);
+        res.send({ success: true, deletedCount: result.deletedCount });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to delete contact submission" });
+      }
+    });
 
     // =============================================
     // Settings APIs
