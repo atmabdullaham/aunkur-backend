@@ -208,6 +208,35 @@ async function run() {
     })
 
 
+    // bkash sms api 
+    router.post('/bkash-sms', async (req, res) => {
+
+      // Security check
+      const secret = req.headers['x-sms-secret'];
+      if (secret !== process.env.BKASH_SMS_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const { from, message } = req.body;
+
+      // Only accept SMS from this specific number
+      if (from !== '01863972739') {
+        return res.status(200).json({ status: 'ignored' });
+      }
+
+      console.log('SMS received from:', from);
+      console.log('Message:', message);
+
+      // Save to MongoDB
+      await db.collection('bkash_sms').insertOne({
+        from,
+        message,
+        receivedAt: new Date()
+      });
+
+      return res.status(200).json({ status: 'saved' });
+    });
+
     app.get("/applications", async (req, res) => {
       const email = req.query.email;
       const query = { email: email }
@@ -255,217 +284,217 @@ async function run() {
 
 
 
-/*
-// $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-// run with shibir related apis
-
-const SERIAL_RANGES = {
-  L:   { start: 1,    end: 500 },
-  M:   { start: 501,  end: 750 },
-  XL:  { start: 751,  end: 1150 },
-  XXL: { start: 1151, end: 1300 },
-  XXXL:{ start: 1301, end: 1350 }
-};
-// _________________________________
-// get all applications
-app.get("/run", async (req, res) => {
-  try {
-    let {
-      limit = 10,
-      skip = 0,
-      sort = "Timestamp",
-      order = "desc",
-      search = "",
-      applicationStatus = ""
-    } = req.query;
-
-    limit = Number(limit);
-    skip = Number(skip);
-
-    let query = {};
-
-    if (applicationStatus) {
-      query.registrationStatus = applicationStatus;
-    }
-
-    if (search) {
-      query.$or = [
-        { fullName: { $regex: search, $options: "i" } },
-        { institutionName: { $regex: search, $options: "i" } },
-        { mobileNumber: { $regex: search, $options: "i" } }
-      ];
-    }
-
-    const sortOption = {};
-    sortOption[sort] = order === "asc" ? 1 : -1;
-
-    const data = await runCollection
-      .find(query)
-      .sort(sortOption)
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await runCollection.countDocuments(query);
-
-    res.send({
-      success: true,
-      data,
-      total,
-      totalPage: Math.ceil(total / limit)
+    /*
+    // $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+    // run with shibir related apis
+    
+    const SERIAL_RANGES = {
+      L:   { start: 1,    end: 500 },
+      M:   { start: 501,  end: 750 },
+      XL:  { start: 751,  end: 1150 },
+      XXL: { start: 1151, end: 1300 },
+      XXXL:{ start: 1301, end: 1350 }
+    };
+    // _________________________________
+    // get all applications
+    app.get("/run", async (req, res) => {
+      try {
+        let {
+          limit = 10,
+          skip = 0,
+          sort = "Timestamp",
+          order = "desc",
+          search = "",
+          applicationStatus = ""
+        } = req.query;
+    
+        limit = Number(limit);
+        skip = Number(skip);
+    
+        let query = {};
+    
+        if (applicationStatus) {
+          query.registrationStatus = applicationStatus;
+        }
+    
+        if (search) {
+          query.$or = [
+            { fullName: { $regex: search, $options: "i" } },
+            { institutionName: { $regex: search, $options: "i" } },
+            { mobileNumber: { $regex: search, $options: "i" } }
+          ];
+        }
+    
+        const sortOption = {};
+        sortOption[sort] = order === "asc" ? 1 : -1;
+    
+        const data = await runCollection
+          .find(query)
+          .sort(sortOption)
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+    
+        const total = await runCollection.countDocuments(query);
+    
+        res.send({
+          success: true,
+          data,
+          total,
+          totalPage: Math.ceil(total / limit)
+        });
+      } catch (error) {
+        res.status(500).send({ error: "Server error" });
+      }
     });
-  } catch (error) {
-    res.status(500).send({ error: "Server error" });
-  }
-});
-*/
+    */
 
 
 
-// =============================================
-// Settings APIs
-// =============================================
+    // =============================================
+    // Settings APIs
+    // =============================================
 
-// GET /settings — public, returns registration state + timer
-app.get('/settings', async (req, res) => {
-  try {
-    const settings = await getSettings();
-    const { registrationEnabled, enrollmentTimerStart, enrollmentTimerEnd } = settings;
-    res.send({ registrationEnabled, enrollmentTimerStart, enrollmentTimerEnd });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to fetch settings" });
-  }
-});
+    // GET /settings — public, returns registration state + timer
+    app.get('/settings', async (req, res) => {
+      try {
+        const settings = await getSettings();
+        const { registrationEnabled, enrollmentTimerStart, enrollmentTimerEnd } = settings;
+        res.send({ registrationEnabled, enrollmentTimerStart, enrollmentTimerEnd });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch settings" });
+      }
+    });
 
-// PATCH /settings/registration — admin only, toggle registration on/off
-app.patch('/settings/registration', verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const { registrationEnabled } = req.body;
-    await settingsCollection.updateOne(
-      {},
-      { $set: { registrationEnabled: Boolean(registrationEnabled) } },
-      { upsert: true }
-    );
-    res.send({ success: true, registrationEnabled: Boolean(registrationEnabled) });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to update registration status" });
-  }
-});
+    // PATCH /settings/registration — admin only, toggle registration on/off
+    app.patch('/settings/registration', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { registrationEnabled } = req.body;
+        await settingsCollection.updateOne(
+          {},
+          { $set: { registrationEnabled: Boolean(registrationEnabled) } },
+          { upsert: true }
+        );
+        res.send({ success: true, registrationEnabled: Boolean(registrationEnabled) });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update registration status" });
+      }
+    });
 
-// PATCH /settings/timer — admin only, set enrollment timer
-app.patch('/settings/timer', verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const { enrollmentTimerStart, enrollmentTimerEnd } = req.body;
-    await settingsCollection.updateOne(
-      {},
-      { $set: { enrollmentTimerStart, enrollmentTimerEnd } },
-      { upsert: true }
-    );
-    res.send({ success: true, enrollmentTimerStart, enrollmentTimerEnd });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to update timer" });
-  }
-});
+    // PATCH /settings/timer — admin only, set enrollment timer
+    app.patch('/settings/timer', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { enrollmentTimerStart, enrollmentTimerEnd } = req.body;
+        await settingsCollection.updateOne(
+          {},
+          { $set: { enrollmentTimerStart, enrollmentTimerEnd } },
+          { upsert: true }
+        );
+        res.send({ success: true, enrollmentTimerStart, enrollmentTimerEnd });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update timer" });
+      }
+    });
 
-// GET /settings/syllabus — public, returns syllabus array
-app.get('/settings/syllabus', async (req, res) => {
-  try {
-    const settings = await getSettings();
-    res.send({ syllabus: settings.syllabus || [] });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to fetch syllabus" });
-  }
-});
+    // GET /settings/syllabus — public, returns syllabus array
+    app.get('/settings/syllabus', async (req, res) => {
+      try {
+        const settings = await getSettings();
+        res.send({ syllabus: settings.syllabus || [] });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch syllabus" });
+      }
+    });
 
-// PUT /settings/syllabus — admin only, replace entire syllabus array
-app.put('/settings/syllabus', verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const { syllabus } = req.body;
-    await settingsCollection.updateOne(
-      {},
-      { $set: { syllabus } },
-      { upsert: true }
-    );
-    res.send({ success: true });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to update syllabus" });
-  }
-});
+    // PUT /settings/syllabus — admin only, replace entire syllabus array
+    app.put('/settings/syllabus', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { syllabus } = req.body;
+        await settingsCollection.updateOne(
+          {},
+          { $set: { syllabus } },
+          { upsert: true }
+        );
+        res.send({ success: true });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update syllabus" });
+      }
+    });
 
-// PATCH /settings/syllabus/:index — admin only, update single class entry
-app.patch('/settings/syllabus/:index', verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const idx = parseInt(req.params.index);
-    const updatedEntry = req.body;
-    const settings = await getSettings();
-    const syllabus = settings.syllabus || [];
-    if (idx < 0 || idx >= syllabus.length) {
-      return res.status(400).send({ message: "Invalid syllabus index" });
-    }
-    syllabus[idx] = { ...syllabus[idx], ...updatedEntry };
-    await settingsCollection.updateOne(
-      {},
-      { $set: { syllabus } },
-      { upsert: true }
-    );
-    res.send({ success: true, entry: syllabus[idx] });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to update syllabus entry" });
-  }
-});
+    // PATCH /settings/syllabus/:index — admin only, update single class entry
+    app.patch('/settings/syllabus/:index', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const idx = parseInt(req.params.index);
+        const updatedEntry = req.body;
+        const settings = await getSettings();
+        const syllabus = settings.syllabus || [];
+        if (idx < 0 || idx >= syllabus.length) {
+          return res.status(400).send({ message: "Invalid syllabus index" });
+        }
+        syllabus[idx] = { ...syllabus[idx], ...updatedEntry };
+        await settingsCollection.updateOne(
+          {},
+          { $set: { syllabus } },
+          { upsert: true }
+        );
+        res.send({ success: true, entry: syllabus[idx] });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update syllabus entry" });
+      }
+    });
 
-// =============================================
-// Applications
-// =============================================
+    // =============================================
+    // Applications
+    // =============================================
 
-//
-app.post('/applications', async (req, res) => {
-  // ✅ Guard: Check if registration is currently open
-  try {
-    const settings = await getSettings();
-    const now = new Date();
-    const timerEnd = settings.enrollmentTimerEnd ? new Date(settings.enrollmentTimerEnd) : null;
-    const timerExpired = timerEnd && now > timerEnd;
+    //
+    app.post('/applications', async (req, res) => {
+      // ✅ Guard: Check if registration is currently open
+      try {
+        const settings = await getSettings();
+        const now = new Date();
+        const timerEnd = settings.enrollmentTimerEnd ? new Date(settings.enrollmentTimerEnd) : null;
+        const timerExpired = timerEnd && now > timerEnd;
 
-    if (!settings.registrationEnabled || timerExpired) {
-      return res.status(403).send({ message: "Registration is currently closed" });
-    }
-  } catch (err) {
-    return res.status(500).send({ message: "Server error checking settings" });
-  }
+        if (!settings.registrationEnabled || timerExpired) {
+          return res.status(403).send({ message: "Registration is currently closed" });
+        }
+      } catch (err) {
+        return res.status(500).send({ message: "Server error checking settings" });
+      }
 
-  const application = req.body;
-  const result = await applicationCollection.insertOne(application);
+      const application = req.body;
+      const result = await applicationCollection.insertOne(application);
 
-  if (result.acknowledged && result.insertedId) {
-    const phone = application?.phone_number?.trim() || "";
-    const name = application?.name_en?.trim() || "";
-    const lastName = name.split(" ").slice(-1)[0] || "";
-    const bkash = application?.bkash_number || "";
-    const tnxId = application?.transaction_Id || "";
-    const syllabusLink = "aunkurctgnorth.org/syllabus";
+      if (result.acknowledged && result.insertedId) {
+        const phone = application?.phone_number?.trim() || "";
+        const name = application?.name_en?.trim() || "";
+        const lastName = name.split(" ").slice(-1)[0] || "";
+        const bkash = application?.bkash_number || "";
+        const tnxId = application?.transaction_Id || "";
+        const syllabusLink = "aunkurctgnorth.org/syllabus";
 
-    const message = `Dear ${lastName}, your registration is received. You'll receive confirmation in 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'25`;
+        const message = `Dear ${lastName}, your registration is received. You'll receive confirmation in 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'25`;
 
-    try {
-      await sendBulkSMS([phone], message);
-    } catch (smsError) {
-      console.error("❌ Failed to send SMS:", smsError.message);
-    }
+        try {
+          await sendBulkSMS([phone], message);
+        } catch (smsError) {
+          console.error("❌ Failed to send SMS:", smsError.message);
+        }
 
-    const telegramText = `📥 New Registration\n👤 Name: ${name}\n📱 Phone: ${phone}\n💳 Bkash: ${bkash}\n🧾 Txn ID: ${tnxId}`;
+        const telegramText = `📥 New Registration\n👤 Name: ${name}\n📱 Phone: ${phone}\n💳 Bkash: ${bkash}\n🧾 Txn ID: ${tnxId}`;
 
-    try {
-      await sendTelegramMessage(telegramText);
-    } catch (error) {
-      console.error("failed to send admin sms", error.message);
-    }
-  }
+        try {
+          await sendTelegramMessage(telegramText);
+        } catch (error) {
+          console.error("failed to send admin sms", error.message);
+        }
+      }
 
-  res.send(result);
-});
+      res.send(result);
+    });
 
-app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
+    app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const { status } = req.body;
 
