@@ -164,43 +164,7 @@ async function run() {
       next()
     }
 
-    // ─── Syllabus Settings API ───────────────────────────────────────
 
-    // GET /settings/syllabus — fetch the syllabus array
-    app.get('/settings/syllabus', async (req, res) => {
-      try {
-        const doc = await settingsCollection.findOne({ type: 'syllabus' });
-        res.send({ syllabus: doc?.syllabus || [] });
-      } catch (error) {
-        console.error("Error fetching syllabus:", error);
-        res.status(500).send({ message: "Failed to fetch syllabus settings" });
-      }
-    });
-
-    // PATCH /settings/syllabus/:index — update a specific syllabus entry by index
-    app.patch('/settings/syllabus/:index', verifyToken, verifyAdmin, async (req, res) => {
-      try {
-        const index = parseInt(req.params.index);
-        const entry = req.body;
-
-        // Build the update using positional key
-        const updateFields = {};
-        for (const [key, value] of Object.entries(entry)) {
-          updateFields[`syllabus.${index}.${key}`] = value;
-        }
-
-        const result = await settingsCollection.updateOne(
-          { type: 'syllabus' },
-          { $set: updateFields },
-          { upsert: true }
-        );
-
-        res.send({ success: true, result });
-      } catch (error) {
-        console.error("Error updating syllabus:", error);
-        res.status(500).send({ message: "Failed to update syllabus entry" });
-      }
-    });
 
     // Routes
     app.get('/', (req, res) => {
