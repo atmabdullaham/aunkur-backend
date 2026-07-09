@@ -173,7 +173,7 @@ async function run() {
 
 
     // bkash sms api 
-    router.post('/bkash-sms', async (req, res) => {
+    app.post('/bkash-sms', async (req, res) => {
 
       // Security check
       const secret = req.headers['x-sms-secret'];
@@ -192,7 +192,7 @@ async function run() {
       console.log('Message:', message);
 
       // Save to MongoDB
-      await db.collection('bkash_sms').insertOne({
+      await database.collection('bkash_sms').insertOne({
         from,
         message,
         receivedAt: new Date()
