@@ -213,6 +213,11 @@ async function run() {
 
     // sms 
     const sendBulkSMS = async (numbersArray, message) => {
+      if (!process.env.BULKSMS_API_KEY || !process.env.BULKSMS_SENDERID) {
+        console.warn("⚠️ BulkSMS configuration is missing. Please set BULKSMS_API_KEY and BULKSMS_SENDERID in your .env file.");
+        return { response_code: 1003, success_message: "", error_message: "BulkSMS environment variables not configured." };
+      }
+
       const smsData = {
         api_key: process.env.BULKSMS_API_KEY,          // replace with your actual API key
         senderid: process.env.BULKSMS_SENDERID,       // replace with your approved sender ID
@@ -236,6 +241,11 @@ async function run() {
 
     // Function to send Telegram message
     const sendTelegramMessage = async (message) => {
+      if (!botToken || !groupChatId) {
+        console.warn("⚠️ Telegram configuration is missing. Please set TELEGRAM_BOT_TOKEN and TELEGRAM_GROUP_CHAT_ID in your .env file.");
+        return;
+      }
+
       const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
       try {
         await axios.post(url, {
@@ -245,7 +255,6 @@ async function run() {
         console.log("✅ Telegram message sent to admin.");
       } catch (error) {
         console.error("❌ Failed to send Telegram message:", error.response?.data || error);
-
       }
     };
 
@@ -745,15 +754,4 @@ async function run() {
   })
 }
 run().catch(console.dir);
-
-
-
-
-
-
-
-
-
-
-
-
+// Triggering nodemon reload to load updated env credentials again
