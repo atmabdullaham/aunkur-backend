@@ -260,74 +260,11 @@ async function run() {
 
 
 
-    /*
-    // $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-    // run with shibir related apis
-    
-    const SERIAL_RANGES = {
-      L:   { start: 1,    end: 500 },
-      M:   { start: 501,  end: 750 },
-      XL:  { start: 751,  end: 1150 },
-      XXL: { start: 1151, end: 1300 },
-      XXXL:{ start: 1301, end: 1350 }
-    };
-    // _________________________________
-    // get all applications
-    app.get("/run", async (req, res) => {
-      try {
-        let {
-          limit = 10,
-          skip = 0,
-          sort = "Timestamp",
-          order = "desc",
-          search = "",
-          applicationStatus = ""
-        } = req.query;
-    
-        limit = Number(limit);
-        skip = Number(skip);
-    
-        let query = {};
-    
-        if (applicationStatus) {
-          query.registrationStatus = applicationStatus;
-        }
-    
-        if (search) {
-          query.$or = [
-            { fullName: { $regex: search, $options: "i" } },
-            { institutionName: { $regex: search, $options: "i" } },
-            { mobileNumber: { $regex: search, $options: "i" } }
-          ];
-        }
-    
-        const sortOption = {};
-        sortOption[sort] = order === "asc" ? 1 : -1;
-    
-        const data = await runCollection
-          .find(query)
-          .sort(sortOption)
-          .skip(skip)
-          .limit(limit)
-          .toArray();
-    
-        const total = await runCollection.countDocuments(query);
-    
-        res.send({
-          success: true,
-          data,
-          total,
-          totalPage: Math.ceil(total / limit)
-        });
-      } catch (error) {
-        res.status(500).send({ error: "Server error" });
-      }
-    });
-    */
 
 
 
-    // =============================================
+
+
     // Notice APIs
     // =============================================
 
