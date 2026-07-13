@@ -101,7 +101,9 @@ async function run() {
     const settingsCollection = database.collection("settings");
     const noticesCollection = database.collection("notices");
     const contactMessagesCollection = database.collection("contact_messages");
-    const smsCollection = database.collection("bkash_sms");
+    const zoneCollection = database.collection("zones");
+    const studentOfTheYearCollection = database.collection("student_of_the_year")
+
     // const runCollection = database.collection("run")
 
     // Helper: get or create the single settings document
@@ -174,35 +176,103 @@ async function run() {
       res.send("Hello Aunkur!")
     })
 
+    app.get("/student-of-the-year", async (req, res) => {
+      const result = await studentOfTheYearCollection
+        .find()
+        .sort({ year: -1 })
+        .toArray();
+      res.send(result)
+    })
 
-    // bkash sms api 
-    app.post('/bkash-sms', async (req, res) => {
+    // Admin Student of the Year routes
+    app.get("/admin/student-of-the-year", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await studentOfTheYearCollection
+        .find()
+        .sort({ year: -1 })
+        .toArray();
+      res.send(result)
+    })
 
-      // Security check
-      const secret = req.headers['x-sms-secret'];
-      if (secret !== process.env.BKASH_SMS_SECRET) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-
-      const { from, message } = req.body;
-
-      // Only accept SMS from this specific number
-      if (from !== '01863972739') {
-        return res.status(200).json({ status: 'ignored' });
-      }
-
-      console.log('SMS received from:', from);
-      console.log('Message:', message);
-
-      // Save to MongoDB
-      await smsCollection.insertOne({
-        from,
-        message,
-        receivedAt: new Date()
+    app.post("/admin/student-of-the-year", verifyToken, verifyAdmin, async (req, res) => {
+      const data = req.body;
+      const result = await studentOfTheYearCollection.insertOne({
+        ...data,
+        createdAt: new Date(),
+        updatedAt: new Date()
       });
+      res.send(result)
+    })
 
-      return res.status(200).json({ status: 'saved' });
+    app.put("/admin/student-of-the-year/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const { id } = req.params;
+      const data = req.body;
+      delete data._id; // prevent updating immutable field
+      const result = await studentOfTheYearCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            ...data,
+            updatedAt: new Date()
+          }
+        }
+      );
+      res.send(result)
+    })
+
+    app.delete("/admin/student-of-the-year/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const { id } = req.params;
+      const result = await studentOfTheYearCollection.deleteOne({ _id: new ObjectId(id) });
+      res.send(result)
+    })
+
+
+    app.get("/zones", async (req, res) => {
+      const result = await zoneCollection
+        .find({ status: "active" })
+        .sort({ regionSlug: 1, name: 1 })
+        .toArray();
+      res.send(result);
+    })
+
+    // ── Admin Zone CRUD (protected) ──────────────────────────────────────────
+
+    // GET all zones for admin dashboard (includes inactive)
+    app.get("/admin/zones", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await zoneCollection
+        .find({})
+        .sort({ regionSlug: 1, name: 1 })
+        .toArray();
+      res.send(result);
     });
+
+    // POST create new zone
+    app.post("/admin/zones", verifyToken, verifyAdmin, async (req, res) => {
+      const zone = req.body;
+      const result = await zoneCollection.insertOne(zone);
+      res.send({ success: true, insertedId: result.insertedId });
+    });
+
+    // PUT update zone
+    app.put("/admin/zones/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const { id } = req.params;
+      const update = req.body;
+      delete update._id; // don't overwrite _id
+      const result = await zoneCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: update }
+      );
+      res.send({ success: true, modifiedCount: result.modifiedCount });
+    });
+
+    // DELETE zone
+    app.delete("/admin/zones/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const { id } = req.params;
+      const result = await zoneCollection.deleteOne(
+        { _id: new ObjectId(id) }
+      );
+      res.send({ success: true, deletedCount: result.deletedCount });
+    });
+
 
     app.get("/applications", async (req, res) => {
       const email = req.query.email;
