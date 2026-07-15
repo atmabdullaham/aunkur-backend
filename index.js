@@ -286,6 +286,64 @@ async function run() {
       res.send({ success: true, deletedCount: result.deletedCount });
     });
 
+    // ── Admin Region CRUD (protected) ────────────────────────────────────────
+
+    // GET all regions for admin dashboard (includes inactive)
+    app.get("/admin/regions", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await regionsCollection
+          .find({})
+          .toArray();
+        res.send(result);
+      } catch (err) {
+        console.error("GET /admin/regions error:", err);
+        res.status(500).json({ error: "Failed to fetch all regions" });
+      }
+    });
+
+    // POST create new region
+    app.post("/admin/regions", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const region = req.body;
+        const result = await regionsCollection.insertOne(region);
+        res.send({ success: true, insertedId: result.insertedId });
+      } catch (err) {
+        console.error("POST /admin/regions error:", err);
+        res.status(500).json({ error: "Failed to create region" });
+      }
+    });
+
+    // PUT update region
+    app.put("/admin/regions/:id", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const update = req.body;
+        delete update._id; // don't overwrite _id
+        const result = await regionsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: update }
+        );
+        res.send({ success: true, modifiedCount: result.modifiedCount });
+      } catch (err) {
+        console.error("PUT /admin/regions error:", err);
+        res.status(500).json({ error: "Failed to update region" });
+      }
+    });
+
+    // DELETE region
+    app.delete("/admin/regions/:id", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const result = await regionsCollection.deleteOne(
+          { _id: new ObjectId(id) }
+        );
+        res.send({ success: true, deletedCount: result.deletedCount });
+      } catch (err) {
+        console.error("DELETE /admin/regions error:", err);
+        res.status(500).json({ error: "Failed to delete region" });
+      }
+    });
+
 
     app.get("/applications", async (req, res) => {
       const email = req.query.email;
