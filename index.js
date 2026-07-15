@@ -102,6 +102,7 @@ async function run() {
     const noticesCollection = database.collection("notices");
     const contactMessagesCollection = database.collection("contact_messages");
     const zoneCollection = database.collection("zones");
+    const regionsCollection = database.collection("regions");
     const studentOfTheYearCollection = database.collection("student_of_the_year")
 
     // const runCollection = database.collection("run")
@@ -232,6 +233,18 @@ async function run() {
         .sort({ regionSlug: 1, name: 1 })
         .toArray();
       res.send(result);
+    })
+
+    app.get("/regions", async (req, res) => {
+      try {
+        const result = await regionsCollection
+          .find({ status: "active" })
+          .toArray();
+        res.json(result);
+      } catch (err) {
+        console.error("GET /regions error:", err);
+        res.status(500).json({ error: "Failed to fetch regions" });
+      }
     })
 
     // ── Admin Zone CRUD (protected) ──────────────────────────────────────────
