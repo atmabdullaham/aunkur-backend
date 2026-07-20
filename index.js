@@ -377,15 +377,13 @@ async function run() {
       }
     };
 
-    // Admin message via telegram
-    const botToken = process.env.TELEGRAM_BOT_TOKEN;
-    const groupChatId = process.env.TELEGRAM_GROUP_CHAT_ID;
-
     // Function to send Telegram message
     const sendTelegramMessage = async (message) => {
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      const groupChatId = process.env.TELEGRAM_GROUP_CHAT_ID;
+
       if (!botToken || !groupChatId) {
-        console.warn("⚠️ Telegram configuration is missing. Please set TELEGRAM_BOT_TOKEN and TELEGRAM_GROUP_CHAT_ID in your .env file.");
-        return;
+        throw new Error("Telegram configuration missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_GROUP_CHAT_ID in server .env");
       }
 
       const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
@@ -394,51 +392,105 @@ async function run() {
           chat_id: groupChatId.trim(),
           text: message,
         });
-        // console.log("✅ Telegram message sent to admin.");
       } catch (error) {
-        console.error("❌ Failed to send Telegram message:", error.response?.data || error);
+        const responseData = error.response?.data;
+        const newChatId = responseData?.parameters?.migrate_to_chat_id;
+
+        if (newChatId) {
+          console.log(`⚠️ Group upgraded to supergroup. Attempting retry with new chat_id: ${newChatId}`);
+          try {
+            await axios.post(url, {
+              chat_id: String(newChatId).trim(),
+              text: message,
+            });
+            console.log(`✅ Message sent to new supergroup ID: ${newChatId}. Please update TELEGRAM_GROUP_CHAT_ID=${newChatId} in server .env`);
+            return;
+          } catch (retryError) {
+            throw new Error(`Group upgraded to supergroup! Please update server/.env: TELEGRAM_GROUP_CHAT_ID=${newChatId}`);
+          }
+        }
+
+        const errMsg = responseData?.description || error.message || "Failed to send message";
+        console.error("❌ Failed to send Telegram message:", errMsg);
+        throw new Error(`Telegram API Error: ${errMsg}`);
       }
     };
 
     // ─── Daily Telegram Report (Bangladesh Time: 8 AM, 3 PM, 10 PM) ──────────
-    // BST (UTC+6) → UTC: 8AM=02:00, 3PM=09:00, 10PM=16:00
     const sendDailyReport = async () => {
-      try {
-        const bstTime = new Date().toLocaleString('en-BD', {
-          timeZone: 'Asia/Dhaka',
-          hour: '2-digit', minute: '2-digit',
-          day: '2-digit', month: 'short', year: 'numeric',
-          hour12: true,
-        });
+      const bstTime = new Date().toLocaleString('en-US', {
+        timeZone: 'Asia/Dhaka',
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      });
 
-        const [pending, accepted, unreadMsg] = await Promise.all([
-          applicationCollection.countDocuments({ reg_status: 'pending' }),
-          applicationCollection.countDocuments({ reg_status: 'accepted' }),
-          contactMessagesCollection.countDocuments({ isRead: { $ne: true } }),
-        ]);
+      const [pending, accepted, unreadMsg] = await Promise.all([
+        applicationCollection.countDocuments({
+          $or: [
+            { reg_status: "under_review" },
+            { reg_status: "pending" },
+            { reg_status: { $exists: false } },
+          ],
+        }),
+        applicationCollection.countDocuments({
+          reg_status: { $regex: /^accepted$/i },
+        }),
+        contactMessagesCollection.countDocuments({ isRead: { $ne: true } }),
+      ]);
 
-        const report =
-          `📊 অংকুর — দৈনিক রিপোর্ট\n` +
-          `🕐 সময়: ${bstTime} (BST)\n` +
-          `────────────────────\n` +
-          `⏳ মোট পেন্ডিং আবেদন: ${pending}\n` +
-          `✅ মোট গৃহীত আবেদন: ${accepted}\n` +
-          `📩 অপঠিত বার্তা: ${unreadMsg}\n` +
-          `────────────────────\n` +
-          `#DailyReport #Aunkur26`;
+      const report =
+        `📊 অংকুর — দৈনিক রিপোর্ট\n` +
+        `🕐 সময়: ${bstTime} (BST)\n` +
+        `────────────────────\n\n` +
+        `📋 Pending Now:    ${pending}\n` +
+        `✅ Accepted Registrations :   ${accepted}\n` +
+        `📩 Unread Message: ${unreadMsg}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `— অংকুর অটোমেশন সিস্টেম`;
 
-        await sendTelegramMessage(report);
-        // console.log(`✅ Daily report sent at ${bstTime} (BST)`);
-      } catch (err) {
-        console.error('❌ Daily report failed:', err.message);
-      }
+      await sendTelegramMessage(report);
     };
 
-    // 8 AM BST = 02:00 UTC | 3 PM BST = 09:00 UTC | 10 PM BST = 16:00 UTC
-    cron.schedule('0 2 * * *', sendDailyReport, { timezone: 'UTC' });
-    cron.schedule('0 9 * * *', sendDailyReport, { timezone: 'UTC' });
-    cron.schedule('0 16 * * *', sendDailyReport, { timezone: 'UTC' });
-    // console.log('📅 Daily Telegram report scheduled: 8 AM | 3 PM | 10 PM (BST)');
+    // 8 AM BST (08:00), 3 PM BST (15:00), 10 PM BST (22:00) in Asia/Dhaka timezone
+    cron.schedule('0 8 * * *', async () => {
+      try { await sendDailyReport(); } catch (err) { console.error("❌ Cron report failed:", err.message); }
+    }, { timezone: 'Asia/Dhaka' });
+
+    cron.schedule('0 15 * * *', async () => {
+      try { await sendDailyReport(); } catch (err) { console.error("❌ Cron report failed:", err.message); }
+    }, { timezone: 'Asia/Dhaka' });
+
+    cron.schedule('0 22 * * *', async () => {
+      try { await sendDailyReport(); } catch (err) { console.error("❌ Cron report failed:", err.message); }
+    }, { timezone: 'Asia/Dhaka' });
+
+    // Endpoint to manually trigger report anytime
+    app.get('/admin/trigger-report', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        await sendDailyReport();
+        res.send({ success: true, message: "Daily report triggered to Telegram." });
+      } catch (err) {
+        res.status(500).send({ success: false, message: err.message });
+      }
+    });
+
+    // Endpoint for Vercel Cron Jobs or external cron services (e.g. cron-job.org)
+    app.get('/api/cron/daily-report', async (req, res) => {
+      const authHeader = req.headers.authorization;
+      if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return res.status(401).json({ success: false, message: "Unauthorized cron request" });
+      }
+      try {
+        await sendDailyReport();
+        res.send({ success: true, message: "Daily report sent to Telegram." });
+      } catch (err) {
+        res.status(500).send({ success: false, message: err.message });
+      }
+    });
     // ─────────────────────────────────────────────────────────────────────────
 
     // Notice APIs
