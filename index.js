@@ -5,6 +5,7 @@ require("dotenv").config();
 const jwt = require('jsonwebtoken');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const ImageKit = require("@imagekit/nodejs");
+const cron = require('node-cron');
 
 
 
@@ -368,7 +369,7 @@ async function run() {
 
       try {
         const response = await axios.post("http://bulksmsbd.net/api/smsapi", smsData);
-        console.log("✅ SMS sent successfully:", response.data);
+        // console.log("✅ SMS sent successfully:", response.data);
         return response.data;
       } catch (error) {
         console.error("❌ SMS sending failed:", error.response?.data || error.message);
@@ -393,18 +394,52 @@ async function run() {
           chat_id: groupChatId.trim(),
           text: message,
         });
-        console.log("✅ Telegram message sent to admin.");
+        // console.log("✅ Telegram message sent to admin.");
       } catch (error) {
         console.error("❌ Failed to send Telegram message:", error.response?.data || error);
       }
     };
 
+    // ─── Daily Telegram Report (Bangladesh Time: 8 AM, 3 PM, 10 PM) ──────────
+    // BST (UTC+6) → UTC: 8AM=02:00, 3PM=09:00, 10PM=16:00
+    const sendDailyReport = async () => {
+      try {
+        const bstTime = new Date().toLocaleString('en-BD', {
+          timeZone: 'Asia/Dhaka',
+          hour: '2-digit', minute: '2-digit',
+          day: '2-digit', month: 'short', year: 'numeric',
+          hour12: true,
+        });
 
+        const [pending, accepted, unreadMsg] = await Promise.all([
+          applicationCollection.countDocuments({ reg_status: 'pending' }),
+          applicationCollection.countDocuments({ reg_status: 'accepted' }),
+          contactMessagesCollection.countDocuments({ isRead: { $ne: true } }),
+        ]);
 
+        const report =
+          `📊 অংকুর — দৈনিক রিপোর্ট\n` +
+          `🕐 সময়: ${bstTime} (BST)\n` +
+          `────────────────────\n` +
+          `⏳ মোট পেন্ডিং আবেদন: ${pending}\n` +
+          `✅ মোট গৃহীত আবেদন: ${accepted}\n` +
+          `📩 অপঠিত বার্তা: ${unreadMsg}\n` +
+          `────────────────────\n` +
+          `#DailyReport #Aunkur26`;
 
+        await sendTelegramMessage(report);
+        // console.log(`✅ Daily report sent at ${bstTime} (BST)`);
+      } catch (err) {
+        console.error('❌ Daily report failed:', err.message);
+      }
+    };
 
-
-
+    // 8 AM BST = 02:00 UTC | 3 PM BST = 09:00 UTC | 10 PM BST = 16:00 UTC
+    cron.schedule('0 2 * * *', sendDailyReport, { timezone: 'UTC' });
+    cron.schedule('0 9 * * *', sendDailyReport, { timezone: 'UTC' });
+    cron.schedule('0 16 * * *', sendDailyReport, { timezone: 'UTC' });
+    // console.log('📅 Daily Telegram report scheduled: 8 AM | 3 PM | 10 PM (BST)');
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Notice APIs
     // =============================================
@@ -486,18 +521,34 @@ async function run() {
     // POST /contact — public, submit message
     app.post('/contact', async (req, res) => {
       try {
-        const { name, email, topic, message } = req.body;
+        const { name, email, whatsapp, topic, message } = req.body;
         if (!name || !email || !message) {
           return res.status(400).send({ message: "Name, email, and message are required fields" });
         }
         const newMessage = {
           name,
           email,
+          whatsapp: whatsapp || "",
           topic: topic || "",
           message,
           submittedAt: new Date()
         };
         const result = await contactMessagesCollection.insertOne(newMessage);
+
+        // Send Telegram notification
+        const telegramText =
+          `📩 নতুন বার্তা এসেছে!\n` +
+          `👤 নাম: ${name}\n` +
+          `📱 WhatsApp: ${whatsapp || "দেওয়া হয়নি"}\n` +
+          `📧 Email: ${email}\n` +
+          `📌 বিষয়: ${topic || "উল্লেখ নেই"}\n` +
+          `💬 বার্তা: ${message}`;
+        try {
+          await sendTelegramMessage(telegramText);
+        } catch (tgErr) {
+          console.error("❌ Telegram notification failed:", tgErr.message);
+        }
+
         res.send({ success: true, insertedId: result.insertedId });
       } catch (error) {
         res.status(500).send({ message: "Failed to send message" });
@@ -525,6 +576,31 @@ async function run() {
         res.status(500).send({ message: "Failed to delete contact submission" });
       }
     });
+
+    // PATCH /contacts/:id/read — admin only, mark message as read
+    app.patch('/contacts/:id/read', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+        const result = await contactMessagesCollection.updateOne(filter, {
+          $set: { isRead: true, readAt: new Date() }
+        });
+        res.send({ success: true, modifiedCount: result.modifiedCount });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to mark message as read" });
+      }
+    });
+
+    // GET /contacts/unread-count — admin only, returns count of unread messages
+    app.get('/contacts/unread-count', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const count = await contactMessagesCollection.countDocuments({ isRead: { $ne: true } });
+        res.send({ count });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch unread count" });
+      }
+    });
+
 
     // =============================================
     // ============================================
@@ -650,7 +726,7 @@ async function run() {
         const tnxId = application?.transaction_Id || "";
         const syllabusLink = "aunkurctgnorth.org/syllabus";
 
-        const message = `Dear ${lastName}, your registration is received. You'll receive confirmation in 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'25`;
+        const message = `Dear ${lastName}, your registration is received! You'll get confirmation within 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'26`;
 
         try {
           await sendBulkSMS([phone], message);
@@ -828,7 +904,7 @@ async function run() {
     // await client.close();
   }
   app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+    // console.log(`Server is running on port ${port}`);
   })
 }
 run().catch(console.dir);

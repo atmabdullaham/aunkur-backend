@@ -22,6 +22,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.17.0",
+    "node-cron": "^4.6.0",
     "node-global-storage": "^3.0.1",
     "router": "^2.2.0",
     "uuid": "^11.1.0"
