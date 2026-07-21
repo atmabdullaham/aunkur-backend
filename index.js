@@ -835,9 +835,9 @@ async function run() {
         let message = "";
 
         if (updatedUser.reg_status === "accepted") {
-          message = `Congratulations! Dear ${lastName}, your Aunkur Scholarship 2025 registration is accepted. Thank you for joining us.\nAunkur Scholarship Project'25`;
+          message = `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n— Aunkur Scholarship Project'26`;
         } else if (updatedUser.reg_status === "rejected") {
-          message = `Dear ${lastName}, your registration was not accepted. If paid, please contact +8801879891623. Thank you.\nAunkur Scholarship Project'25`;
+          message = `Dear ${lastName}, your Aunkur Scholarship'26 application was not accepted. If you have made a payment, please contact +8801879891623`;
         }
         try {
           await sendBulkSMS([phone], message);
