@@ -484,34 +484,33 @@ async function run() {
     const handleCronRequest = async (req, res) => {
       const cronSecret = process.env.CRON_SECRET;
 
-      // Always enforce secret if configured
-      if (cronSecret) {
-        const authHeader = req.headers.authorization;
-        const querySecret = req.query.secret;
-
-        const headerValid = authHeader === `Bearer ${cronSecret}`;
-        const queryValid  = querySecret === cronSecret;
-
-        if (!headerValid && !queryValid) {
-          console.warn(`⛔ Unauthorized cron attempt at ${new Date().toISOString()} — IP: ${req.ip}`);
-          return res.status(401).json({ success: false, message: "Unauthorized cron request" });
-        }
-      } else {
-        // CRON_SECRET not configured — block all access for safety
-        console.error("❌ CRON_SECRET is not set in .env. Cron endpoint is disabled for security.");
-        return res.status(503).json({ success: false, message: "Cron endpoint not configured. Set CRON_SECRET in server .env" });
+      if (!cronSecret) {
+        return res.status(503).json({ success: false, message: "CRON_SECRET not set" });
       }
 
-      const triggeredAt = new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true });
-      console.log(`🕐 External cron triggered at ${triggeredAt} (BST)`);
+      const authHeader = req.headers['authorization'];
+      const querySecret = req.query.secret;
+
+      const headerValid = authHeader === `Bearer ${cronSecret}`;
+      const queryValid = querySecret === cronSecret;
+
+      if (!headerValid && !queryValid) {
+        console.warn(`⛔ Unauthorized cron attempt — IP: ${req.ip}`);
+        return res.status(401).json({ success: false, message: "Unauthorized" });
+      }
+
+      const triggeredAt = new Date().toLocaleString('en-US', {
+        timeZone: 'Asia/Dhaka',
+        hour12: true
+      });
+      console.log(`🕐 Cron triggered at ${triggeredAt}`);
 
       try {
         await sendDailyReport();
-        console.log("✅ Daily report sent successfully via external cron.");
-        res.json({ success: true, message: "Daily report sent to Telegram.", triggeredAt });
+        return res.json({ success: true, message: "Daily report sent.", triggeredAt });
       } catch (err) {
-        console.error("❌ External cron report failed:", err.message);
-        res.status(500).json({ success: false, message: err.message });
+        console.error("❌ Cron failed:", err.message);
+        return res.status(500).json({ success: false, message: err.message });
       }
     };
 
