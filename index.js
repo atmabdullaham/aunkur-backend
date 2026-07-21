@@ -455,18 +455,8 @@ async function run() {
       await sendTelegramMessage(report);
     };
 
-    // 8 AM BST (08:00), 3 PM BST (15:00), 10 PM BST (22:00) in Asia/Dhaka timezone
-    cron.schedule('0 8 * * *', async () => {
-      try { await sendDailyReport(); } catch (err) { console.error("❌ Cron report failed:", err.message); }
-    }, { timezone: 'Asia/Dhaka' });
-
-    cron.schedule('0 15 * * *', async () => {
-      try { await sendDailyReport(); } catch (err) { console.error("❌ Cron report failed:", err.message); }
-    }, { timezone: 'Asia/Dhaka' });
-
-    cron.schedule('0 22 * * *', async () => {
-      try { await sendDailyReport(); } catch (err) { console.error("❌ Cron report failed:", err.message); }
-    }, { timezone: 'Asia/Dhaka' });
+    // ⚠️ node-cron schedules removed — external cron service (cron-job.org) handles scheduling.
+    // node-cron does NOT work reliably on Vercel serverless. Use /api/cron/daily-report endpoint instead.
 
     // Endpoint to manually trigger report anytime
     app.get('/admin/trigger-report', verifyToken, verifyAdmin, async (req, res) => {
