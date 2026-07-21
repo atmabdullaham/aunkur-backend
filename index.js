@@ -478,19 +478,45 @@ async function run() {
       }
     });
 
-    // Endpoint for Vercel Cron Jobs or external cron services (e.g. cron-job.org)
-    app.get('/api/cron/daily-report', async (req, res) => {
-      const authHeader = req.headers.authorization;
-      if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-        return res.status(401).json({ success: false, message: "Unauthorized cron request" });
+    // ─── External Cron Service Endpoint ──────────────────────────────────────
+    // Supports GET & POST (cron-job.org, cron-job.io, EasyCron, UptimeRobot, etc.)
+    // Auth: Authorization: Bearer <CRON_SECRET>  OR  ?secret=<CRON_SECRET>
+    const handleCronRequest = async (req, res) => {
+      const cronSecret = process.env.CRON_SECRET;
+
+      // Always enforce secret if configured
+      if (cronSecret) {
+        const authHeader = req.headers.authorization;
+        const querySecret = req.query.secret;
+
+        const headerValid = authHeader === `Bearer ${cronSecret}`;
+        const queryValid  = querySecret === cronSecret;
+
+        if (!headerValid && !queryValid) {
+          console.warn(`⛔ Unauthorized cron attempt at ${new Date().toISOString()} — IP: ${req.ip}`);
+          return res.status(401).json({ success: false, message: "Unauthorized cron request" });
+        }
+      } else {
+        // CRON_SECRET not configured — block all access for safety
+        console.error("❌ CRON_SECRET is not set in .env. Cron endpoint is disabled for security.");
+        return res.status(503).json({ success: false, message: "Cron endpoint not configured. Set CRON_SECRET in server .env" });
       }
+
+      const triggeredAt = new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka', hour12: true });
+      console.log(`🕐 External cron triggered at ${triggeredAt} (BST)`);
+
       try {
         await sendDailyReport();
-        res.send({ success: true, message: "Daily report sent to Telegram." });
+        console.log("✅ Daily report sent successfully via external cron.");
+        res.json({ success: true, message: "Daily report sent to Telegram.", triggeredAt });
       } catch (err) {
-        res.status(500).send({ success: false, message: err.message });
+        console.error("❌ External cron report failed:", err.message);
+        res.status(500).json({ success: false, message: err.message });
       }
-    });
+    };
+
+    app.get('/api/cron/daily-report', handleCronRequest);
+    app.post('/api/cron/daily-report', handleCronRequest);
     // ─────────────────────────────────────────────────────────────────────────
 
     // Notice APIs
