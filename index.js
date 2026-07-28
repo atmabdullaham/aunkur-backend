@@ -1,16 +1,12 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const helmet = require("helmet");
-require("dotenv").config();
+const cors = require('cors');
 const jwt = require('jsonwebtoken');
+require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const ImageKit = require("@imagekit/nodejs");
 const cron = require('node-cron');
-
-
-
-const cors = require('cors');
-require('dotenv').config();
 const axios = require('axios');
 
 const app = express();
@@ -764,11 +760,31 @@ async function run() {
       }
     });
 
-    // =============================================
-    // Applications
-    // =============================================
+    // GET /applications/check-txn/:txnId — check if Txn ID is already used
+    app.get('/applications/check-txn/:txnId', async (req, res) => {
+      try {
+        const txnId = req.params.txnId?.trim();
+        if (!txnId) {
+          return res.send({ exists: false });
+        }
+        // Escaping special characters for safety in regex
+        const escapedTxnId = txnId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const existingApp = await applicationCollection.findOne({
+          transaction_Id: { $regex: new RegExp(`^${escapedTxnId}$`, "i") }
+        });
+        if (existingApp) {
+          return res.send({
+            exists: true,
+            message: "এই ট্রানজেকশন আইডি (Transaction ID) টি ইতোমধ্যে একজন আবেদনকারী ব্যবহার করেছেন। প্রতিটি ট্রানজেকশন আইডি কেবল একবার ব্যবহার করা যাবে।"
+          });
+        }
+        res.send({ exists: false });
+      } catch (err) {
+        console.error("Error checking transaction ID:", err);
+        res.status(500).send({ message: "Server error checking Transaction ID" });
+      }
+    });
 
-    //
     app.post('/applications', async (req, res) => {
       // ✅ Guard: Check if registration is currently open
       try {
@@ -785,6 +801,21 @@ async function run() {
       }
 
       const application = req.body;
+
+      // ✅ Guard: Duplicate Transaction ID check
+      if (application.transaction_Id) {
+        const txnId = application.transaction_Id.trim();
+        const escapedTxnId = txnId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const existingTxn = await applicationCollection.findOne({
+          transaction_Id: { $regex: new RegExp(`^${escapedTxnId}$`, "i") }
+        });
+        if (existingTxn) {
+          return res.status(400).send({
+            message: "এই ট্রানজেকশন আইডি (Transaction ID) টি ইতোমধ্যে একজন আবেদনকারী ব্যবহার করেছেন।"
+          });
+        }
+      }
+
       const result = await applicationCollection.insertOne(application);
 
       if (result.acknowledged && result.insertedId) {
