@@ -9,6 +9,8 @@ const ImageKit = require("@imagekit/nodejs");
 const cron = require('node-cron');
 const axios = require('axios');
 
+const { sendMetaCapiEvent } = require('./utils/metaCapi');
+
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -840,6 +842,30 @@ async function run() {
           await sendTelegramMessage(telegramText);
         } catch (error) {
           console.error("failed to send admin sms", error.message);
+        }
+
+        // ✅ Meta Conversions API (CAPI) Server-side event
+        const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
+        const userAgent = req.headers['user-agent'];
+        const eventId = application.event_id || (tnxId ? `reg_${tnxId.trim().toUpperCase()}` : `reg_${Date.now()}`);
+
+        try {
+          await sendMetaCapiEvent({
+            eventName: "CompleteRegistration",
+            eventId: eventId,
+            userData: {
+              name,
+              phone,
+              clientIp,
+              userAgent,
+            },
+            customData: {
+              transaction_Id: tnxId,
+              bkash_number: bkash,
+            },
+          });
+        } catch (capiError) {
+          console.error("❌ Failed to send Meta CAPI event:", capiError.message);
         }
       }
 
