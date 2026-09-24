@@ -994,6 +994,12 @@ async function run() {
     app.post('/applications/offline', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       try {
         const body = req.body;
+        if (!body.reference || !String(body.reference).trim()) {
+          return res.status(400).json({
+            success: false,
+            message: "রেফারেন্স জোন নির্বাচন করা আবশ্যক (Reference zone is required)."
+          });
+        }
         const currentUser = req.user;
         const examCenter = (body.exam_center || "chawkbazar").toLowerCase().trim();
 
@@ -1030,7 +1036,8 @@ async function run() {
           const creatorName = currentUser?.name || req.decoded?.email;
 
           // Send Telegram notification to admins
-          const telegramText = `📥 New Registration [OFFLINE]\n📋 Form No: ${formNumber}\n🔢 Paper Serial: ${nextSerial}\n👤 Name: ${name}\n📱 Phone: ${phone}\n🏫 School: ${school}\n✍️ Entered by: ${creatorName}`;
+          const refZone = offlineApplication?.reference || "N/A";
+          const telegramText = `📥 New Registration [OFFLINE]\n📋 Form No: ${formNumber}\n🔢 Paper Serial: ${nextSerial}\n👤 Name: ${name}\n📱 Phone: ${phone}\n🏫 School: ${school}\n🏛️ Ref: ${refZone}\n✍️ Entered by: ${creatorName}`;
           try {
             await sendTelegramMessage(telegramText);
           } catch (error) {
@@ -1139,7 +1146,7 @@ async function run() {
 
     })
 
-    app.get('/registrations', verifyToken, verifyAdmin, async (req, res) => {
+    app.get('/registrations', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       const result = await applicationCollection.find().toArray()
       res.send(result)
     })
