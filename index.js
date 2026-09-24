@@ -996,18 +996,6 @@ async function run() {
             console.error("Failed to send admin telegram message", error.message);
           }
 
-          // Optional SMS to student
-          if (phone) {
-            const lastName = name.split(" ").slice(-1)[0] || "";
-            const syllabusLink = "aunkurctgnorth.org/syllabus";
-            const message = `Dear ${lastName}, your offline registration (Serial: ${nextSerial}, Form: ${formNumber}) is received! You'll get confirmation within 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'26`;
-            try {
-              await sendBulkSMS([phone], message);
-            } catch (smsError) {
-              console.error("❌ Failed to send SMS:", smsError.message);
-            }
-          }
-
           return res.send({
             success: true,
             insertedId: result.insertedId,
@@ -1036,6 +1024,30 @@ async function run() {
           { _id: { $in: objectIds } },
           { $set: { reg_status: "accepted", acceptedAt: new Date().toISOString() } }
         );
+
+        // Fetch numbers to send batch SMS
+        try {
+          const acceptedApps = await applicationCollection
+            .find({ _id: { $in: objectIds } })
+            .project({ phone_number: 1, name_en: 1 })
+            .toArray();
+
+          const smsPromises = acceptedApps
+            .filter(a => a.phone_number && /^01[0-9]{9}$/.test(a.phone_number.trim()))
+            .map(a => {
+              const phone = a.phone_number.trim();
+              const lastName = (a.name_en?.trim() || "").split(" ").slice(-1)[0] || "applicant";
+              const smsMessage = `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n— Aunkur Scholarship Project'26`;
+              return sendBulkSMS([phone], smsMessage);
+            });
+
+          if (smsPromises.length > 0) {
+            await Promise.allSettled(smsPromises);
+          }
+        } catch (smsError) {
+          console.error("Batch SMS notification failed:", smsError.message);
+        }
+
         res.send(result);
       } catch (err) {
         console.error("Batch accept error:", err);
