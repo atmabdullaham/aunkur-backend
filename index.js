@@ -102,9 +102,70 @@ async function run() {
     const contactMessagesCollection = database.collection("contact_messages");
     const zoneCollection = database.collection("zones");
     const regionsCollection = database.collection("regions");
-    const studentOfTheYearCollection = database.collection("student_of_the_year")
+    const studentOfTheYearCollection = database.collection("student_of_the_year");
+    const countersCollection = database.collection("counters");
 
-    // const runCollection = database.collection("run")
+    // Center-wise Numeric Serial Configuration:
+    // Chawkbazar: 1001-1999 (base 1000)
+    // Chandgaon:  2001-2999 (base 2000)
+    // Kotwali:    3001-3999 (base 3000)
+    // Nasirabad:  4001-4999 (base 4000)
+    // Bayezid:    5001-5999 (base 5000)
+    const CENTER_SERIAL_CONFIG = {
+      chawkbazar: { base: 1000, label: "চকবাজার" },
+      chandgaon:  { base: 2000, label: "চাঁদগাঁও" },
+      kotwali:    { base: 3000, label: "কোতোয়ালী" },
+      nasirabad:  { base: 4000, label: "নাসিরাবাদ" },
+      bayezid:    { base: 5000, label: "বায়েজিদ" },
+    };
+
+    // Atomic sequential counter per exam center for offline registrations (100% collision-free)
+    const getNextOfflineSerial = async (center = "chawkbazar") => {
+      const normalizedCenter = (center || "chawkbazar").toLowerCase().trim();
+      const config = CENTER_SERIAL_CONFIG[normalizedCenter] || { base: 1000 };
+      const counterId = `offline_serial_${normalizedCenter}`;
+
+      // Step 1: Attempt atomic increment
+      const result = await countersCollection.findOneAndUpdate(
+        { _id: counterId },
+        { $inc: { seq: 1 } },
+        { returnDocument: "after" }
+      );
+
+      if (result && typeof result.seq === "number") {
+        return result.seq;
+      }
+
+      // Step 2: Initialize if counter doesn't exist yet for this center
+      const lastApp = await applicationCollection
+        .find({
+          registration_type: "offline",
+          exam_center: normalizedCenter,
+          offline_serial: { $exists: true }
+        })
+        .sort({ offline_serial: -1 })
+        .limit(1)
+        .toArray();
+
+      const maxExisting = lastApp.length > 0 && typeof lastApp[0].offline_serial === "number"
+        ? lastApp[0].offline_serial
+        : config.base;
+
+      const initialSeq = Math.max(config.base, maxExisting) + 1;
+
+      try {
+        await countersCollection.insertOne({ _id: counterId, seq: initialSeq });
+        return initialSeq;
+      } catch (err) {
+        // In case of concurrent insert race condition, increment atomically
+        const retry = await countersCollection.findOneAndUpdate(
+          { _id: counterId },
+          { $inc: { seq: 1 } },
+          { returnDocument: "after" }
+        );
+        return retry.seq;
+      }
+    };
 
     // Helper: get or create the single settings document
     const getSettings = async () => {
@@ -167,6 +228,22 @@ async function run() {
         return res.status(403).send({ message: "Forbidden Access" })
       }
       next()
+    }
+
+    // Middleware to verify coordinator or admin role
+    const verifyCoordinatorOrAdmin = async (req, res, next) => {
+      const email = req.decoded?.email;
+      if (!email) {
+        return res.status(401).send({ message: "Unauthorized access" });
+      }
+      const query = { email: email };
+      const user = await userCollection.findOne(query);
+      const isAuthorized = user?.role === "admin" || user?.role === "coordinator";
+      if (!isAuthorized) {
+        return res.status(403).send({ message: "Forbidden Access. Coordinator or Admin role required." });
+      }
+      req.user = user;
+      next();
     }
 
 
@@ -872,6 +949,100 @@ async function run() {
       res.send(result);
     });
 
+    // POST /applications/offline - for Coordinator and Admin entries
+    app.post('/applications/offline', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const body = req.body;
+        const currentUser = req.user;
+        const examCenter = (body.exam_center || "chawkbazar").toLowerCase().trim();
+
+        // Atomic sequential serial number per exam center (100% collision-free)
+        const nextSerial = await getNextOfflineSerial(examCenter);
+        const formNumber = `OFF-26-${nextSerial}`;
+
+        const offlineApplication = {
+          ...body,
+          registration_type: "offline",
+          payment_status: "paid",
+          reg_status: "under_review",
+          offline_serial: nextSerial,
+          paper_serial_no: nextSerial,
+          form_number: formNumber,
+          bkash_number: null,
+          transaction_Id: null,
+          created_by: {
+            user_id: currentUser?._id ? currentUser._id.toString() : null,
+            name: currentUser?.name || currentUser?.displayName || req.decoded?.name || "Coordinator",
+            email: req.decoded?.email,
+            role: currentUser?.role || "coordinator",
+            timestamp: new Date().toISOString()
+          },
+          submittedAt: new Date().toISOString()
+        };
+
+        const result = await applicationCollection.insertOne(offlineApplication);
+
+        if (result.acknowledged && result.insertedId) {
+          const phone = offlineApplication?.phone_number?.trim() || "";
+          const name = offlineApplication?.name_en?.trim() || "";
+          const school = offlineApplication?.school_name?.trim() || "";
+          const creatorName = currentUser?.name || req.decoded?.email;
+
+          // Send Telegram notification to admins
+          const telegramText = `📥 New Registration [OFFLINE]\n📋 Form No: ${formNumber}\n🔢 Paper Serial: ${nextSerial}\n👤 Name: ${name}\n📱 Phone: ${phone}\n🏫 School: ${school}\n✍️ Entered by: ${creatorName}`;
+          try {
+            await sendTelegramMessage(telegramText);
+          } catch (error) {
+            console.error("Failed to send admin telegram message", error.message);
+          }
+
+          // Optional SMS to student
+          if (phone) {
+            const lastName = name.split(" ").slice(-1)[0] || "";
+            const syllabusLink = "aunkurctgnorth.org/syllabus";
+            const message = `Dear ${lastName}, your offline registration (Serial: ${nextSerial}, Form: ${formNumber}) is received! You'll get confirmation within 24 hrs. Syllabus: ${syllabusLink}.\nAunkur'26`;
+            try {
+              await sendBulkSMS([phone], message);
+            } catch (smsError) {
+              console.error("❌ Failed to send SMS:", smsError.message);
+            }
+          }
+
+          return res.send({
+            success: true,
+            insertedId: result.insertedId,
+            form_number: formNumber,
+            paper_serial_no: nextSerial,
+            data: offlineApplication
+          });
+        }
+
+        res.status(500).send({ message: "Failed to record offline registration" });
+      } catch (err) {
+        console.error("Error creating offline registration:", err);
+        res.status(500).send({ message: err.message || "Internal server error" });
+      }
+    });
+
+    // PATCH /applications/batch-accept - Admin batch approval for applications (offline cash batches or online)
+    app.patch('/applications/batch-accept', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { ids } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0) {
+          return res.status(400).send({ message: "No application IDs provided" });
+        }
+        const objectIds = ids.map(id => new ObjectId(id));
+        const result = await applicationCollection.updateMany(
+          { _id: { $in: objectIds } },
+          { $set: { reg_status: "accepted", acceptedAt: new Date().toISOString() } }
+        );
+        res.send(result);
+      } catch (err) {
+        console.error("Batch accept error:", err);
+        res.status(500).send({ message: "Failed to batch accept" });
+      }
+    });
+
     app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const { status } = req.body;
@@ -990,30 +1161,34 @@ async function run() {
 
     app.patch('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
-      const filter = { _id: new ObjectId(id) }
+      const filter = { _id: new ObjectId(id) };
+      const requestedRole = req.body?.role || "admin";
       const updatedDoc = {
         $set: {
-          role: "admin"
+          role: requestedRole
         },
       };
-      const result = await userCollection.updateOne(filter, updatedDoc)
-      res.send(result)
-
-    })
+      const result = await userCollection.updateOne(filter, updatedDoc);
+      res.send(result);
+    });
 
     app.get('/users/admin/:email', verifyToken, async (req, res) => {
       const email = req.params.email;
       if (email !== req.decoded.email) {
-        return res.status(403).send({ message: "Forbidden access" })
+        return res.status(403).send({ message: "Forbidden access" });
       }
       const query = { email: email };
       const user = await userCollection.findOne(query);
-      let admin = false;
-      if (user) {
-        admin = user?.role === 'admin'
-      }
-      res.send({ admin })
-    })
+      const isAdmin = user?.role === 'admin';
+      const isCoordinator = user?.role === 'coordinator' || isAdmin;
+      res.send({ 
+        admin: isAdmin, 
+        coordinator: isCoordinator, 
+        role: user?.role || 'user',
+        name: user?.name,
+        email: user?.email
+      });
+    });
 
 
 
