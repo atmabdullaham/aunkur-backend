@@ -194,29 +194,50 @@ async function run() {
 
 
 
-    // jwt related apis
+    // jwt related apis - strictly verified token issuance
     app.post('/jwt', async (req, res) => {
-      const user = req.body;
-      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-        expiresIn: '5h' // Token will expire in 5 hour
-      })
-      res.send({ token })
-    })
+      try {
+        const email = req.body?.email?.toLowerCase()?.trim();
+        if (!email || typeof email !== "string" || !email.includes("@")) {
+          return res.status(400).send({ message: "Valid email is required" });
+        }
+
+        // Look up user to embed verified database role (cannot be forged by client)
+        const existingUser = await userCollection.findOne({ email });
+        const userPayload = {
+          email,
+          role: existingUser?.role || "user"
+        };
+
+        const token = jwt.sign(userPayload, process.env.ACCESS_TOKEN_SECRET, {
+          expiresIn: '7d' // Token expires in 7 days
+        });
+        res.send({ token });
+      } catch (err) {
+        res.status(500).send({ message: "Failed to generate token" });
+      }
+    });
 
     // Middleware to verify JWT
     const verifyToken = (req, res, next) => {
       if (!req.headers.authorization) {
-        return res.status(401).send({ message: "Unauthorized access" })
+        return res.status(401).send({ message: "Unauthorized access" });
       }
-      const token = req.headers.authorization.split(' ')[1];
+      const authHeader = req.headers.authorization;
+      const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : authHeader;
+
+      if (!token || token === 'null' || token === 'undefined') {
+        return res.status(401).send({ message: "Unauthorized access. No valid token found." });
+      }
+
       jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
         if (err) {
-          return res.status(401).send({ message: "Unauthorized access" })
+          return res.status(401).send({ message: "Unauthorized access" });
         }
         req.decoded = decoded;
-        next()
-      })
-    }
+        next();
+      });
+    };
 
     // Middleware to verify admin role
     const verifyAdmin = async (req, res, next) => {
@@ -421,12 +442,32 @@ async function run() {
     });
 
 
-    app.get("/applications", async (req, res) => {
-      const email = req.query.email;
-      const query = { email: email }
-      const result = await applicationCollection.find(query).toArray()
-      res.send(result)
-    })
+    app.get("/applications", verifyToken, async (req, res) => {
+      try {
+        const requestedEmail = req.query.email?.toLowerCase()?.trim();
+        const userEmail = req.decoded?.email?.toLowerCase()?.trim();
+
+        // If querying another email, verify requester has admin or coordinator privileges
+        if (requestedEmail && requestedEmail !== userEmail) {
+          const requester = await userCollection.findOne({ email: userEmail });
+          const isAuthorized = requester?.role === "admin" || requester?.role === "coordinator";
+          if (!isAuthorized) {
+            return res.status(403).send({ message: "Forbidden Access" });
+          }
+        }
+
+        const targetEmail = requestedEmail || userEmail;
+        if (!targetEmail) {
+          return res.status(400).send({ message: "Valid email is required" });
+        }
+
+        const query = { email: targetEmail };
+        const result = await applicationCollection.find(query).toArray();
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: "Failed to fetch applications" });
+      }
+    });
 
     // sms 
     const sendBulkSMS = async (numbersArray, message) => {
@@ -1137,26 +1178,54 @@ async function run() {
 
 
 
-    app.get('/registration-details/:id', async (req, res) => {
-      const id = req.params.id;
-      const filter = { _id: new ObjectId(id) };
-      const result = await applicationCollection.findOne(filter)
-      res.send(result)
-
-    })
-
-
-    // user collection
-    app.post('/user', async (req, res) => {
-      const user = req.body;
-      const query = { email: user.email }
-      const existingUser = await userCollection.findOne(query)
-      if (existingUser) {
-        return res.send({ message: "User already esists" })
+    app.get('/registration-details/:id', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid registration ID" });
+        }
+        const filter = { _id: new ObjectId(id) };
+        const result = await applicationCollection.findOne(filter);
+        if (!result) {
+          return res.status(404).send({ message: "Registration not found" });
+        }
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: "Failed to fetch registration details" });
       }
-      const result = await userCollection.insertOne(user)
-      res.send(result)
-    })
+    });
+
+
+    // user collection - secure self-registration
+    app.post('/user', async (req, res) => {
+      try {
+        const email = req.body?.email?.toLowerCase()?.trim();
+        if (!email) {
+          return res.status(400).send({ message: "Email is required" });
+        }
+
+        const query = { email: email };
+        const existingUser = await userCollection.findOne(query);
+        if (existingUser) {
+          return res.send({ message: "User already exists", insertedId: existingUser._id });
+        }
+
+        // CRITICAL SECURITY FIX: Enforce role: "user" for self-registration.
+        // Role elevation to admin or coordinator must only be granted via PATCH /users/:id by an admin.
+        const safeUser = {
+          uid: req.body?.uid || null,
+          email: email,
+          name: req.body?.name || "",
+          role: "user",
+          createdAt: new Date().toISOString()
+        };
+
+        const result = await userCollection.insertOne(safeUser);
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: "Failed to create user record" });
+      }
+    });
 
     app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
 
