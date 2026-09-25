@@ -10,16 +10,21 @@ const cron = require('node-cron');
 const axios = require('axios');
 const { rateLimit } = require('express-rate-limit');
 
-const { initializeApp: initFirebaseAdmin } = require('firebase-admin/app');
+const { initializeApp: initFirebaseAdmin, getApps } = require('firebase-admin/app');
 const { getAuth: getFirebaseAuth } = require('firebase-admin/auth');
 
 const { sendMetaCapiEvent } = require('./utils/metaCapi');
 
 // Firebase Admin — used only to verify client ID tokens (no service account needed, just the project ID)
-if (!process.env.FIREBASE_PROJECT_ID) {
-  console.warn("⚠️ FIREBASE_PROJECT_ID is not set. /jwt will reject all requests.");
+let firebaseAuth = null;
+try {
+  const firebaseAdminApp = getApps().length
+    ? getApps()[0]
+    : initFirebaseAdmin({ projectId: process.env.FIREBASE_PROJECT_ID || "aunkur-ctg-north" });
+  firebaseAuth = getFirebaseAuth(firebaseAdminApp);
+} catch (fbErr) {
+  console.warn("⚠️ Firebase Admin initialization warning:", fbErr.message);
 }
-const firebaseAuth = getFirebaseAuth(initFirebaseAdmin({ projectId: process.env.FIREBASE_PROJECT_ID }));
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -70,16 +75,27 @@ app.use('/api', require('./routes/routes'))
 
 
 // --- ImageKit Client ---
-const imgkitClient = new ImageKit({
-  privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
-  publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
-  urlEndpoint: process.env.PUBLICURL,
-});
+let imgkitClient = null;
+try {
+  if (process.env.IMAGEKIT_PRIVATE_KEY && process.env.IMAGEKIT_PUBLIC_KEY && process.env.PUBLICURL) {
+    imgkitClient = new ImageKit({
+      privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+      publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+      urlEndpoint: process.env.PUBLICURL,
+    });
+  } else {
+    console.warn("⚠️ ImageKit environment variables are missing or incomplete.");
+  }
+} catch (ikErr) {
+  console.error("⚠️ ImageKit initialization error:", ikErr.message);
+}
 
 app.get("/auth", function (req, res) {
-  // Your application logic to authenticate the user
-  // For example, you can check if the user is logged in or has the necessary permissions
-  // If the user is not authenticated, you can return an error response
+  if (!imgkitClient) {
+    return res.status(503).json({
+      error: "ImageKit is not configured. Please set IMAGEKIT_PRIVATE_KEY, IMAGEKIT_PUBLIC_KEY, and PUBLICURL in environment variables."
+    });
+  }
   const { token, expire, signature } =
     imgkitClient.helper.getAuthenticationParameters();
   res.send({
@@ -1560,9 +1576,14 @@ async function run() {
     // Ensures that the client will close when you finish/error
     // await client.close();
   }
-  app.listen(port, () => {
-    // console.log(`Server is running on port ${port}`);
-  })
+
+  // Only start listening when not running in Vercel serverless runtime
+  if (!process.env.VERCEL) {
+    app.listen(port, () => {
+      console.log(`Server is running on port ${port}`);
+    });
+  }
 }
 run().catch(console.dir);
-// Triggering nodemon reload to load updated env credentials again
+
+module.exports = app;
