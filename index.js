@@ -8,11 +8,24 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const ImageKit = require("@imagekit/nodejs");
 const cron = require('node-cron');
 const axios = require('axios');
+const { rateLimit } = require('express-rate-limit');
+
+const { initializeApp: initFirebaseAdmin } = require('firebase-admin/app');
+const { getAuth: getFirebaseAuth } = require('firebase-admin/auth');
 
 const { sendMetaCapiEvent } = require('./utils/metaCapi');
 
+// Firebase Admin — used only to verify client ID tokens (no service account needed, just the project ID)
+if (!process.env.FIREBASE_PROJECT_ID) {
+  console.warn("⚠️ FIREBASE_PROJECT_ID is not set. /jwt will reject all requests.");
+}
+const firebaseAuth = getFirebaseAuth(initFirebaseAdmin({ projectId: process.env.FIREBASE_PROJECT_ID }));
+
 const app = express();
 const port = process.env.PORT || 5000;
+
+// Behind Vercel's proxy — needed so rate limiting sees the real client IP
+app.set('trust proxy', 1);
 
 
 
@@ -194,16 +207,37 @@ async function run() {
 
 
 
-    // jwt related apis - strictly verified token issuance
+    // jwt related apis - issued only against a verified Firebase ID token
     app.post('/jwt', async (req, res) => {
+      const idToken = req.body?.idToken;
+      if (!idToken || typeof idToken !== "string") {
+        return res.status(400).send({ message: "Firebase ID token is required" });
+      }
+
+      let decodedIdToken;
       try {
-        const email = req.body?.email?.toLowerCase()?.trim();
-        if (!email || typeof email !== "string" || !email.includes("@")) {
-          return res.status(400).send({ message: "Valid email is required" });
+        decodedIdToken = await firebaseAuth.verifyIdToken(idToken);
+      } catch (err) {
+        return res.status(401).send({ message: "Invalid or expired Firebase token" });
+      }
+
+      try {
+        // Email comes from the verified token, never from the request body
+        const email = decodedIdToken.email?.toLowerCase()?.trim();
+        if (!email) {
+          return res.status(400).send({ message: "Account has no email address" });
         }
 
         // Look up user to embed verified database role (cannot be forged by client)
         const existingUser = await userCollection.findOne({ email });
+
+        // Privileged accounts must have a verified email, otherwise someone could create an
+        // unverified Firebase account for an admin's address and inherit that role
+        const isPrivileged = existingUser?.role === "admin" || existingUser?.role === "coordinator";
+        if (isPrivileged && !decodedIdToken.email_verified) {
+          return res.status(403).send({ message: "Email must be verified for this account" });
+        }
+
         const userPayload = {
           email,
           role: existingUser?.role || "user"
@@ -993,13 +1027,18 @@ async function run() {
     // POST /applications/offline - for Coordinator and Admin entries
     app.post('/applications/offline', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       try {
-        const body = req.body;
-        if (!body.reference || !String(body.reference).trim()) {
+        const body = req.body || {};
+        // The form now records thana (branch) and ward (sub_branch) instead of the old reference zone
+        const branch = typeof body.branch === "string" ? body.branch.trim() : "";
+        const subBranch = typeof body.sub_branch === "string" ? body.sub_branch.trim() : "";
+        if (!branch || !subBranch) {
           return res.status(400).json({
             success: false,
-            message: "রেফারেন্স জোন নির্বাচন করা আবশ্যক (Reference zone is required)."
+            message: "থানা ও ওয়ার্ড নির্বাচন করা আবশ্যক (Thana and ward are required)."
           });
         }
+        body.branch = branch;
+        body.sub_branch = subBranch;
         const currentUser = req.user;
         const examCenter = (body.exam_center || "chawkbazar").toLowerCase().trim();
 
@@ -1036,8 +1075,8 @@ async function run() {
           const creatorName = currentUser?.name || req.decoded?.email;
 
           // Send Telegram notification to admins
-          const refZone = offlineApplication?.reference || "N/A";
-          const telegramText = `📥 New Registration [OFFLINE]\n📋 Form No: ${formNumber}\n🔢 Paper Serial: ${nextSerial}\n👤 Name: ${name}\n📱 Phone: ${phone}\n🏫 School: ${school}\n🏛️ Ref: ${refZone}\n✍️ Entered by: ${creatorName}`;
+          const thanaWard = `${offlineApplication.branch} / ${offlineApplication.sub_branch}`;
+          const telegramText = `📥 New Registration [OFFLINE]\n📋 Form No: ${formNumber}\n🔢 Paper Serial: ${nextSerial}\n👤 Name: ${name}\n📱 Phone: ${phone}\n🏫 School: ${school}\n🏛️ Thana/Ward: ${thanaWard}\n✍️ Entered by: ${creatorName}`;
           try {
             await sendTelegramMessage(telegramText);
           } catch (error) {
@@ -1048,6 +1087,7 @@ async function run() {
             success: true,
             insertedId: result.insertedId,
             form_number: formNumber,
+            offline_serial: nextSerial, // the entry form reads this to show the serial
             paper_serial_no: nextSerial,
             data: offlineApplication
           });
@@ -1103,34 +1143,66 @@ async function run() {
       }
     });
 
+    const ALLOWED_REG_STATUSES = ["under_review", "accepted", "rejected"];
+
     app.patch('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
-      const { status } = req.body;
+      const { status } = req.body || {};
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid application ID" });
+      }
+      if (!ALLOWED_REG_STATUSES.includes(status)) {
+        return res.status(400).send({ message: `Status must be one of: ${ALLOWED_REG_STATUSES.join(", ")}` });
+      }
 
       const filter = { _id: new ObjectId(id) };
-      const updateDoc = { $set: { reg_status: status } };
+      const now = new Date().toISOString();
+      const updateFields = {
+        reg_status: status,
+        statusUpdatedAt: now,
+        statusUpdatedBy: req.decoded?.email || null,
+      };
+      if (status === "accepted") {
+        updateFields.acceptedAt = now; // matches batch-accept
+      }
 
-      const result = await applicationCollection.updateOne(filter, updateDoc);
+      // Only touch the record when the status actually changes, so repeat clicks don't re-send SMS
+      const result = await applicationCollection.updateOne(
+        { ...filter, reg_status: { $ne: status } },
+        { $set: updateFields }
+      );
 
-      if (result.modifiedCount > 0) {
-        // ✅ Fetch user info (to get phone number)
-        const updatedUser = await applicationCollection.findOne(filter);
-        const phone = updatedUser?.phone_number; // Assuming you store phone number in bkash_number
-        const name = updatedUser.name_en;
-        const lastName = name?.trim()?.split(" ").slice(-1)[0] || "";
-
-        // ✅ Send confirmation SMS
-        let message = "";
-
-        if (updatedUser.reg_status === "accepted") {
-          message = `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n— Aunkur Scholarship Project'26`;
-        } else if (updatedUser.reg_status === "rejected") {
-          message = `Dear ${lastName}, your Aunkur Scholarship'26 application was not accepted. If you have made a payment, please contact +8801879891623`;
+      if (result.matchedCount === 0) {
+        const exists = await applicationCollection.countDocuments(filter, { limit: 1 });
+        if (!exists) {
+          return res.status(404).send({ message: "Application not found" });
         }
-        try {
-          await sendBulkSMS([phone], message);
-        } catch (smsError) {
-          console.error("❌ Failed to send SMS:", smsError.message);
+      }
+
+      // SMS only for a final decision — moving back to under_review notifies nobody
+      if (result.modifiedCount > 0 && (status === "accepted" || status === "rejected")) {
+        const application = await applicationCollection.findOne(filter, { projection: { phone_number: 1, name_en: 1, registration_type: 1 } });
+        const phone = application?.phone_number?.trim() || "";
+        const lastName = application?.name_en?.trim()?.split(" ").slice(-1)[0] || "applicant";
+
+        // Offline entries are verified in person when the paper form and cash are taken,
+        // so a rejection is an internal correction — texting the family would only confuse them
+        const isOfflineRejection = status === "rejected" && application?.registration_type === "offline";
+
+        if (isOfflineRejection) {
+          console.log(`ℹ️ Skipped rejection SMS for offline application ${id}`);
+        } else if (/^01[0-9]{9}$/.test(phone)) {
+          const message = status === "accepted"
+            ? `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n— Aunkur Scholarship Project'26`
+            : `Dear ${lastName}, your Aunkur Scholarship'26 application was not accepted. If you have made a payment, please contact +8801879891623`;
+          try {
+            await sendBulkSMS([phone], message);
+          } catch (smsError) {
+            console.error("❌ Failed to send SMS:", smsError.message);
+          }
+        } else {
+          console.warn(`⚠️ Skipped status SMS for application ${id}: invalid phone number`);
         }
       }
 
@@ -1140,34 +1212,184 @@ async function run() {
 
     app.delete('/applications/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
-      const filter = { _id: new ObjectId(id) }
-      const result = await applicationCollection.deleteOne(filter)
-      res.send(result)
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid application ID" });
+      }
+      const filter = { _id: new ObjectId(id) };
+      const result = await applicationCollection.deleteOne(filter);
+      if (result.deletedCount === 0) {
+        return res.status(404).send({ message: "Application not found" });
+      }
+      res.send(result);
+    });
 
-    })
+    // ─── Offline entry deletion requests ─────────────────────────────────────
+    // Coordinators cannot delete; they ask an admin, who deletes or dismisses the request.
+
+    // POST — the coordinator who created the entry requests its deletion
+    app.post('/applications/:id/delete-request', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      const id = req.params.id;
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid application ID" });
+      }
+      const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+      if (!reason) {
+        return res.status(400).send({ message: "মুছে ফেলার কারণ লিখুন (A reason is required)." });
+      }
+      if (reason.length > 500) {
+        return res.status(400).send({ message: "কারণটি ৫০০ অক্ষরের মধ্যে লিখুন (Reason must be under 500 characters)." });
+      }
+
+      const filter = { _id: new ObjectId(id) };
+      const application = await applicationCollection.findOne(filter, {
+        projection: { registration_type: 1, created_by: 1, delete_request: 1, name_en: 1, form_number: 1, paper_serial_no: 1 },
+      });
+      if (!application) {
+        return res.status(404).send({ message: "Application not found" });
+      }
+
+      const requesterEmail = req.decoded?.email?.toLowerCase();
+      const isOwner = application.created_by?.email?.toLowerCase() === requesterEmail;
+      if (application.registration_type !== "offline" || !isOwner) {
+        return res.status(403).send({ message: "আপনি শুধু নিজের অফলাইন এন্ট্রির জন্য অনুরোধ করতে পারবেন।" });
+      }
+      if (application.delete_request?.status === "pending") {
+        return res.status(409).send({ message: "এই এন্ট্রির জন্য ইতোমধ্যে একটি অনুরোধ অপেক্ষমাণ আছে।" });
+      }
+
+      const deleteRequest = {
+        status: "pending",
+        reason,
+        requested_by: {
+          email: requesterEmail,
+          name: req.user?.name || requesterEmail,
+        },
+        requestedAt: new Date().toISOString(),
+      };
+      const result = await applicationCollection.updateOne(filter, { $set: { delete_request: deleteRequest } });
+
+      const telegramText =
+        `🗑️ Delete Request [OFFLINE]\n` +
+        `📋 Form No: ${application.form_number || application.paper_serial_no || "N/A"}\n` +
+        `👤 Name: ${application.name_en || "N/A"}\n` +
+        `✍️ Requested by: ${deleteRequest.requested_by.name}\n` +
+        `💬 Reason: ${reason}`;
+      try {
+        await sendTelegramMessage(telegramText);
+      } catch (error) {
+        console.error("Failed to send delete-request telegram message", error.message);
+      }
+
+      res.send({ success: true, modifiedCount: result.modifiedCount, delete_request: deleteRequest });
+    });
+
+    // DELETE — admin dismisses a pending request (the entry is kept)
+    app.delete('/applications/:id/delete-request', verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid application ID" });
+      }
+      const result = await applicationCollection.updateOne(
+        { _id: new ObjectId(id), "delete_request.status": "pending" },
+        {
+          $set: {
+            "delete_request.status": "dismissed",
+            "delete_request.resolvedBy": req.decoded?.email || null,
+            "delete_request.resolvedAt": new Date().toISOString(),
+          },
+        }
+      );
+      if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "No pending delete request for this application" });
+      }
+      res.send({ success: true, modifiedCount: result.modifiedCount });
+    });
 
     app.get('/registrations', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       const result = await applicationCollection.find().toArray()
       res.send(result)
     })
 
-    app.get('/registrations/search', async (req, res) => {
+    // Offline registrations page.
+    // entries: full records for the table — every offline entry for admins, only their own for coordinators.
+    // summary: every offline entry, stripped to the fields the summary cards need (no personal details).
+    app.get('/offline-registrations', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       try {
-        let { phone } = req.query;
+        const isAdmin = req.user?.role === "admin";
+        // Same rule the page used client-side: typed offline, or carrying a paper serial
+        const offlineFilter = {
+          $or: [
+            { registration_type: "offline" },
+            { paper_serial_no: { $exists: true, $nin: [null, ""] } },
+            { offline_serial: { $exists: true, $nin: [null, ""] } },
+          ],
+        };
+        const entriesFilter = isAdmin
+          ? offlineFilter
+          : { ...offlineFilter, "created_by.email": req.decoded?.email?.toLowerCase() };
 
-        if (!phone) {
-          return res.status(400).json({ success: false, message: "Phone number is required" });
+        const [entries, summary] = await Promise.all([
+          applicationCollection.find(entriesFilter).sort({ submittedAt: -1 }).toArray(),
+          applicationCollection
+            .find(offlineFilter)
+            .project({
+              _id: 0,
+              branch: 1,
+              sub_branch: 1,
+              reference: 1,
+              exam_center: 1,
+              reg_status: 1,
+              "created_by.email": 1,
+              "created_by.name": 1,
+            })
+            .toArray(),
+        ]);
+
+        res.send({ entries, summary });
+      } catch (err) {
+        console.error("Error fetching offline registrations:", err);
+        res.status(500).send({ message: "Failed to fetch offline registrations" });
+      }
+    });
+
+    // Public status lookup — limited per IP to slow down phone-number enumeration
+    const registrationSearchLimiter = rateLimit({
+      windowMs: 15 * 60 * 1000,
+      limit: 10,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: {
+        success: false,
+        message: "অনেকবার অনুসন্ধান করা হয়েছে। অনুগ্রহ করে ১৫ মিনিট পর আবার চেষ্টা করুন।"
+      },
+    });
+
+    // Only what a public status check needs — never contact, address, parent or payment details
+    const PUBLIC_SEARCH_PROJECTION = {
+      _id: 0,
+      name_bn: 1,
+      name_en: 1,
+      student_class: 1,
+      exam_center: 1,
+      reg_status: 1,
+      submittedAt: 1,
+    };
+
+    app.get('/registrations/search', registrationSearchLimiter, async (req, res) => {
+      try {
+        const phone = typeof req.query.phone === "string" ? req.query.phone.replace(/\s+/g, "") : "";
+
+        // Strict Bangladeshi mobile format — digits only, so it is safe to build a regex from
+        if (!/^01[3-9]\d{8}$/.test(phone)) {
+          return res.status(400).json({ success: false, message: "সঠিক ১১ ডিজিটের মোবাইল নম্বর দিন।" });
         }
 
-        // Clean the input (remove spaces, trim)
-        phone = phone.replace(/\s+/g, "").trim();
-
-        // Create regex that ignores spaces inside stored phone_number
+        // Exact match that still tolerates spaces inside stored phone_number values
         const regex = new RegExp(`^\\s*${phone.split("").join("\\s*")}\\s*$`);
 
-        // Find all registrations that match this regex
         const registrations = await applicationCollection
           .find({ phone_number: { $regex: regex } })
+          .project(PUBLIC_SEARCH_PROJECTION)
           .toArray();
 
         if (!registrations.length) {
@@ -1195,6 +1417,12 @@ async function run() {
         const result = await applicationCollection.findOne(filter);
         if (!result) {
           return res.status(404).send({ message: "Registration not found" });
+        }
+        // Coordinators may only open entries they created themselves
+        const isAdmin = req.user?.role === "admin";
+        const isOwner = result.created_by?.email?.toLowerCase() === req.decoded?.email?.toLowerCase();
+        if (!isAdmin && !isOwner) {
+          return res.status(403).send({ message: "আপনি শুধু নিজের এন্ট্রির বিস্তারিত দেখতে পারবেন।" });
         }
         res.send(result);
       } catch (err) {
@@ -1240,20 +1468,60 @@ async function run() {
       res.send(result)
     })
 
+    const ALLOWED_ROLES = ["user", "coordinator", "admin"];
+
+    // True when removing admin rights from this user would leave the site with no admin
+    const isLastAdmin = async (targetUser) => {
+      if (targetUser?.role !== "admin") return false;
+      const adminCount = await userCollection.countDocuments({ role: "admin" });
+      return adminCount <= 1;
+    };
+
     app.delete('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
-      const query = { _id: new ObjectId(id) }
-      const result = await userCollection.deleteOne(query)
-      res.send(result)
-    })
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid user ID" });
+      }
+      const query = { _id: new ObjectId(id) };
+
+      const targetUser = await userCollection.findOne(query);
+      if (!targetUser) {
+        return res.status(404).send({ message: "User not found" });
+      }
+      if (await isLastAdmin(targetUser)) {
+        return res.status(409).send({ message: "Cannot delete the last admin. Make another user admin first." });
+      }
+
+      const result = await userCollection.deleteOne(query);
+      res.send(result);
+    });
 
     app.patch('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
+      const requestedRole = req.body?.role;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid user ID" });
+      }
+      // Never fall back to a default role — a missing or unknown role is rejected
+      if (!ALLOWED_ROLES.includes(requestedRole)) {
+        return res.status(400).send({ message: `Role must be one of: ${ALLOWED_ROLES.join(", ")}` });
+      }
+
       const filter = { _id: new ObjectId(id) };
-      const requestedRole = req.body?.role || "admin";
+      const targetUser = await userCollection.findOne(filter);
+      if (!targetUser) {
+        return res.status(404).send({ message: "User not found" });
+      }
+      if (requestedRole !== "admin" && await isLastAdmin(targetUser)) {
+        return res.status(409).send({ message: "Cannot demote the last admin. Make another user admin first." });
+      }
+
       const updatedDoc = {
         $set: {
-          role: requestedRole
+          role: requestedRole,
+          roleUpdatedBy: req.decoded?.email || null,
+          roleUpdatedAt: new Date().toISOString(),
         },
       };
       const result = await userCollection.updateOne(filter, updatedDoc);
