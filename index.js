@@ -20,7 +20,7 @@ let firebaseAuth = null;
 try {
   const firebaseAdminApp = getApps().length
     ? getApps()[0]
-    : initFirebaseAdmin({ projectId: process.env.FIREBASE_PROJECT_ID || "aunkur-ctg-north" });
+    : initFirebaseAdmin({ projectId: process.env.FIREBASE_PROJECT_ID || "aunkur-scholarship" });
   firebaseAuth = getFirebaseAuth(firebaseAdminApp);
 } catch (fbErr) {
   console.warn("⚠️ Firebase Admin initialization warning:", fbErr.message);
