@@ -519,6 +519,15 @@ async function run() {
       }
     });
 
+    // Helper to format/capitalize last name for SMS (Title Case e.g., 'rahim' -> 'Rahim')
+    const formatLastName = (nameEn) => {
+      if (!nameEn || typeof nameEn !== "string") return "Applicant";
+      const parts = nameEn.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) return "Applicant";
+      const rawLast = parts[parts.length - 1];
+      return rawLast.charAt(0).toUpperCase() + rawLast.slice(1).toLowerCase();
+    };
+
     // sms 
     const sendBulkSMS = async (numbersArray, message) => {
       if (!process.env.BULKSMS_API_KEY || !process.env.BULKSMS_SENDERID) {
@@ -991,7 +1000,7 @@ async function run() {
       if (result.acknowledged && result.insertedId) {
         const phone = application?.phone_number?.trim() || "";
         const name = application?.name_en?.trim() || "";
-        const lastName = name.split(" ").slice(-1)[0] || "";
+        const lastName = formatLastName(name);
         const bkash = application?.bkash_number || "";
         const tnxId = application?.transaction_Id || "";
         const syllabusLink = "aunkurctgnorth.org/syllabus";
@@ -1140,8 +1149,8 @@ async function run() {
             .filter(a => a.phone_number && /^01[0-9]{9}$/.test(a.phone_number.trim()))
             .map(a => {
               const phone = a.phone_number.trim();
-              const lastName = (a.name_en?.trim() || "").split(" ").slice(-1)[0] || "applicant";
-              const smsMessage = `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n— Aunkur Scholarship Project'26`;
+              const lastName = formatLastName(a.name_en);
+              const smsMessage = `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n- Aunkur Scholarship Project'26`;
               return sendBulkSMS([phone], smsMessage);
             });
 
@@ -1200,7 +1209,7 @@ async function run() {
       if (result.modifiedCount > 0 && (status === "accepted" || status === "rejected")) {
         const application = await applicationCollection.findOne(filter, { projection: { phone_number: 1, name_en: 1, registration_type: 1 } });
         const phone = application?.phone_number?.trim() || "";
-        const lastName = application?.name_en?.trim()?.split(" ").slice(-1)[0] || "applicant";
+        const lastName = formatLastName(application?.name_en);
 
         // Offline entries are verified in person when the paper form and cash are taken,
         // so a rejection is an internal correction — texting the family would only confuse them
@@ -1210,7 +1219,7 @@ async function run() {
           console.log(`ℹ️ Skipped rejection SMS for offline application ${id}`);
         } else if (/^01[0-9]{9}$/.test(phone)) {
           const message = status === "accepted"
-            ? `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n— Aunkur Scholarship Project'26`
+            ? `Dear ${lastName}, your Aunkur Scholarship'26 application has been accepted!\n\n- Aunkur Scholarship Project'26`
             : `Dear ${lastName}, your Aunkur Scholarship'26 application was not accepted. If you have made a payment, please contact +8801879891623`;
           try {
             await sendBulkSMS([phone], message);
@@ -1321,6 +1330,226 @@ async function run() {
       res.send({ success: true, modifiedCount: result.modifiedCount });
     });
 
+    // ─── Offline Entry Edit & Correction System ─────────────────────────────
+    // Admin directly edits; coordinators submit an edit request that an admin must approve.
+
+    // 1. PATCH — Admin directly edits any field of an offline registration
+    app.patch('/applications/:id/offline-direct-edit', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid application ID" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const existing = await applicationCollection.findOne(filter);
+        if (!existing) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        const allowedFields = [
+          "name_en", "name_bn", "phone_number", "whatsapp_number", "student_class",
+          "school_name", "branch", "sub_branch", "exam_center", "gender",
+          "father_name", "father_occupation", "mother_name", "mother_occupation",
+          "present_area", "present_thana", "present_zilla",
+          "permanent_area", "permanent_thana", "permanent_zilla",
+          "form_number", "paper_serial_no", "note"
+        ];
+
+        const updates = {};
+        for (const field of allowedFields) {
+          if (req.body[field] !== undefined) {
+            updates[field] = req.body[field];
+          }
+        }
+
+        updates.last_edited_by = {
+          email: req.decoded?.email || null,
+          name: req.user?.name || req.decoded?.email || "Admin",
+          editedAt: new Date().toISOString(),
+        };
+
+        // If there was an active pending edit request, automatically mark it approved/applied
+        if (existing.edit_request?.status === "pending") {
+          updates["edit_request.status"] = "approved";
+          updates["edit_request.resolved_by"] = {
+            email: req.decoded?.email || null,
+            name: req.user?.name || req.decoded?.email || "Admin",
+          };
+          updates["edit_request.resolvedAt"] = new Date().toISOString();
+        }
+
+        const result = await applicationCollection.updateOne(filter, { $set: updates });
+        const updatedDoc = await applicationCollection.findOne(filter);
+        res.send({ success: true, modifiedCount: result.modifiedCount, data: updatedDoc });
+      } catch (err) {
+        console.error("Direct edit error:", err);
+        res.status(500).send({ message: "Failed to update registration" });
+      }
+    });
+
+    // 2. POST — Coordinator submits an edit/correction request
+    app.post('/applications/:id/edit-request', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid application ID" });
+        }
+
+        const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+        if (!reason) {
+          return res.status(400).send({ message: "সংশোধনের কারণ লিখুন (A reason for edit is required)." });
+        }
+        if (reason.length > 500) {
+          return res.status(400).send({ message: "কারণটি ৫০০ অক্ষরের মধ্যে লিখুন (Reason must be under 500 characters)." });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const application = await applicationCollection.findOne(filter);
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        const requesterEmail = req.decoded?.email?.toLowerCase();
+        const isAdmin = req.user?.role === "admin";
+        const isOwner = application.created_by?.email?.toLowerCase() === requesterEmail;
+
+        if (!isAdmin && !isOwner) {
+          return res.status(403).send({ message: "আপনি শুধু নিজের অফলাইন এন্ট্রির জন্য সংশোধনের অনুরোধ করতে পারবেন।" });
+        }
+
+        if (application.edit_request?.status === "pending") {
+          return res.status(409).send({ message: "এই এন্ট্রির জন্য ইতোমধ্যে একটি সংশোধনের অনুরোধ অপেক্ষমাণ আছে।" });
+        }
+
+        const allowedFields = [
+          "name_en", "name_bn", "phone_number", "whatsapp_number", "student_class",
+          "school_name", "branch", "sub_branch", "exam_center", "gender",
+          "father_name", "father_occupation", "mother_name", "mother_occupation",
+          "present_area", "present_thana", "present_zilla",
+          "permanent_area", "permanent_thana", "permanent_zilla",
+          "form_number", "paper_serial_no", "note"
+        ];
+
+        const proposed_data = {};
+        for (const field of allowedFields) {
+          if (req.body?.proposed_data && req.body.proposed_data[field] !== undefined) {
+            proposed_data[field] = req.body.proposed_data[field];
+          }
+        }
+
+        const editRequest = {
+          status: "pending",
+          reason,
+          requested_by: {
+            email: requesterEmail,
+            name: req.user?.name || requesterEmail,
+          },
+          requestedAt: new Date().toISOString(),
+          proposed_data,
+        };
+
+        const result = await applicationCollection.updateOne(filter, { $set: { edit_request: editRequest } });
+
+        // Telegram Notification for Admins
+        const telegramText =
+          `✏️ Edit Request [OFFLINE]\n` +
+          `📋 Form No: ${application.form_number || application.paper_serial_no || application.offline_serial || "N/A"}\n` +
+          `👤 Student: ${application.name_en || "N/A"} (${application.name_bn || ""})\n` +
+          `✍️ Requested by: ${editRequest.requested_by.name}\n` +
+          `💬 Reason: ${reason}`;
+        try {
+          await sendTelegramMessage(telegramText);
+        } catch (error) {
+          console.error("Failed to send edit-request telegram message:", error.message);
+        }
+
+        res.send({ success: true, modifiedCount: result.modifiedCount, edit_request: editRequest });
+      } catch (err) {
+        console.error("Edit request error:", err);
+        res.status(500).send({ message: "Failed to submit edit request" });
+      }
+    });
+
+    // 3. PATCH — Admin approves and applies the pending edit request
+    app.patch('/applications/:id/edit-request/approve', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid application ID" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const application = await applicationCollection.findOne(filter);
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        if (application.edit_request?.status !== "pending") {
+          return res.status(400).send({ message: "কোনো অপেক্ষমাণ সংশোধনের অনুরোধ নেই।" });
+        }
+
+        const proposed = application.edit_request.proposed_data || {};
+        const updateFields = { ...proposed };
+
+        updateFields["edit_request.status"] = "approved";
+        updateFields["edit_request.resolved_by"] = {
+          email: req.decoded?.email || null,
+          name: req.user?.name || req.decoded?.email || "Admin",
+        };
+        updateFields["edit_request.resolvedAt"] = new Date().toISOString();
+        updateFields.last_edited_by = {
+          email: req.decoded?.email || null,
+          name: req.user?.name || req.decoded?.email || "Admin",
+          editedAt: new Date().toISOString(),
+        };
+
+        const result = await applicationCollection.updateOne(filter, { $set: updateFields });
+        const updatedDoc = await applicationCollection.findOne(filter);
+        res.send({ success: true, modifiedCount: result.modifiedCount, data: updatedDoc });
+      } catch (err) {
+        console.error("Approve edit request error:", err);
+        res.status(500).send({ message: "Failed to approve edit request" });
+      }
+    });
+
+    // 4. PATCH — Admin rejects/dismisses the pending edit request
+    app.patch('/applications/:id/edit-request/reject', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid application ID" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const application = await applicationCollection.findOne(filter);
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        if (application.edit_request?.status !== "pending") {
+          return res.status(400).send({ message: "কোনো অপেক্ষমাণ সংশোধনের অনুরোধ নেই।" });
+        }
+
+        const updateFields = {
+          "edit_request.status": "rejected",
+          "edit_request.resolved_by": {
+            email: req.decoded?.email || null,
+            name: req.user?.name || req.decoded?.email || "Admin",
+          },
+          "edit_request.resolvedAt": new Date().toISOString(),
+          "edit_request.admin_note": req.body?.admin_note || "অনুরোধটি বাতিল করা হয়েছে",
+        };
+
+        const result = await applicationCollection.updateOne(filter, { $set: updateFields });
+        const updatedDoc = await applicationCollection.findOne(filter);
+        res.send({ success: true, modifiedCount: result.modifiedCount, data: updatedDoc });
+      } catch (err) {
+        console.error("Reject edit request error:", err);
+        res.status(500).send({ message: "Failed to reject edit request" });
+      }
+    });
+
     app.get('/registrations', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       const result = await applicationCollection.find().toArray()
       res.send(result)
@@ -1340,23 +1569,33 @@ async function run() {
             { offline_serial: { $exists: true, $nin: [null, ""] } },
           ],
         };
+        const requesterEmail = (req.decoded?.email || "").trim();
         const entriesFilter = isAdmin
           ? offlineFilter
-          : { ...offlineFilter, "created_by.email": req.decoded?.email?.toLowerCase() };
+          : {
+              ...offlineFilter,
+              $or: [
+                { "created_by.email": requesterEmail.toLowerCase() },
+                { "created_by.email": requesterEmail },
+                { "created_by.email": { $regex: new RegExp(`^${requesterEmail}$`, "i") } },
+              ],
+            };
 
         const [entries, summary] = await Promise.all([
           applicationCollection.find(entriesFilter).sort({ submittedAt: -1 }).toArray(),
           applicationCollection
             .find(offlineFilter)
             .project({
-              _id: 0,
+              _id: 1,
               branch: 1,
               sub_branch: 1,
               reference: 1,
               exam_center: 1,
               reg_status: 1,
-              "created_by.email": 1,
-              "created_by.name": 1,
+              created_by: 1,
+              registration_type: 1,
+              paper_serial_no: 1,
+              offline_serial: 1,
             })
             .toArray(),
         ]);
