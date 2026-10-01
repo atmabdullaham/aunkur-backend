@@ -1550,6 +1550,647 @@ async function run() {
       }
     });
 
+    // ========================================================
+    // EXAM ROLL MANAGEMENT CONSTANTS & ENGINE
+    // ========================================================
+    const EXAM_YEAR = "26"; // 2026
+
+    const EXAM_CENTERS = [
+      { key: "chawkbazar", code: "1", label_en: "Chawkbazar", label_bn: "চকবাজার" },
+      { key: "chandgaon", code: "2", label_en: "Chandgaon", label_bn: "চাঁদগাঁও" },
+      { key: "kotwali", code: "3", label_en: "Kotwali", label_bn: "কোতোয়ালী" },
+      { key: "nasirabad", code: "4", label_en: "Nasirabad", label_bn: "নাসিরাবাদ" },
+      { key: "bayezid", code: "5", label_en: "Bayezid", label_bn: "বায়েজিদ" },
+    ];
+
+    const EXAM_CLASSES = [
+      { key: "four", code: "4", label_en: "Class 4", label_bn: "চতুর্থ শ্রেণি" },
+      { key: "five", code: "5", label_en: "Class 5", label_bn: "পঞ্চম শ্রেণি" },
+      { key: "six", code: "6", label_en: "Class 6", label_bn: "ষষ্ঠ শ্রেণি" },
+      { key: "seven", code: "7", label_en: "Class 7", label_bn: "সপ্তম শ্রেণি" },
+      { key: "eight", code: "8", label_en: "Class 8", label_bn: "অষ্টম শ্রেণি" },
+      { key: "nine", code: "9", label_en: "Class 9", label_bn: "নবম শ্রেণি" },
+      { key: "ten", code: "0", label_en: "Class 10", label_bn: "দশম শ্রেণি" },
+    ];
+
+    const EXAM_GENDERS = [
+      { key: "male", code: "1", label_en: "Boy", label_bn: "ছাত্র" },
+      { key: "female", code: "2", label_en: "Girl", label_bn: "ছাত্রী" },
+    ];
+
+    const CENTER_LOOKUP = Object.fromEntries(EXAM_CENTERS.map((c) => [c.key, c]));
+    const CLASS_LOOKUP = Object.fromEntries(
+      EXAM_CLASSES.flatMap((k) => [
+        [k.key, k],
+        [k.code, k],
+        [k.code === "0" ? "10" : k.code, k],
+      ])
+    );
+    const GENDER_LOOKUP = {
+      male: EXAM_GENDERS[0],
+      boy: EXAM_GENDERS[0],
+      female: EXAM_GENDERS[1],
+      girl: EXAM_GENDERS[1],
+    };
+
+    const resolveCandidateBucket = (app) => {
+      const centerRaw = (app.exam_center || "chawkbazar").toString().trim().toLowerCase();
+      const center = CENTER_LOOKUP[centerRaw] || EXAM_CENTERS[0];
+
+      const classRaw = (app.student_class || "eight").toString().trim().toLowerCase();
+      const studentClass = CLASS_LOOKUP[classRaw] || EXAM_CLASSES[4]; // default 8
+
+      const genderRaw = (app.gender || "male").toString().trim().toLowerCase();
+      const gender = GENDER_LOOKUP[genderRaw] || EXAM_GENDERS[0]; // default boy
+
+      const bucketKey = `${center.code}_${studentClass.code}_${gender.code}`;
+      return { center, studentClass, gender, bucketKey };
+    };
+
+    // 1. GET /admin/exam-rolls/summary - Bucket matrix and overall roll stats
+    app.get('/admin/exam-rolls/summary', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const settings = await settingsCollection.findOne({}) || {};
+        const acceptedApps = await applicationCollection
+          .find({ reg_status: "accepted" })
+          .project({
+            _id: 1,
+            name_en: 1,
+            exam_center: 1,
+            student_class: 1,
+            gender: 1,
+            exam_roll: 1,
+            exam_roll_bucket: 1,
+            admit_card: 1,
+            admit_downloaded: 1,
+          })
+          .toArray();
+
+        // Initialize 70 standard buckets
+        const bucketMap = {};
+        for (const center of EXAM_CENTERS) {
+          for (const studentClass of EXAM_CLASSES) {
+            for (const gender of EXAM_GENDERS) {
+              const bucketKey = `${center.code}_${studentClass.code}_${gender.code}`;
+              bucketMap[bucketKey] = {
+                bucketKey,
+                centerKey: center.key,
+                centerCode: center.code,
+                centerLabelBn: center.label_bn,
+                centerLabelEn: center.label_en,
+                classKey: studentClass.key,
+                classCode: studentClass.code,
+                classLabelBn: studentClass.label_bn,
+                classLabelEn: studentClass.label_en,
+                genderKey: gender.key,
+                genderCode: gender.code,
+                genderLabelBn: gender.label_bn,
+                genderLabelEn: gender.label_en,
+                totalAccepted: 0,
+                rollsAssigned: 0,
+                rollsPending: 0,
+                admitDownloaded: 0,
+                downloadPending: 0,
+                maxRoll: null,
+                maxSerial: 0,
+              };
+            }
+          }
+        }
+
+        let totalAccepted = 0;
+        let totalRollsAssigned = 0;
+        let totalRollsPending = 0;
+        let totalDownloaded = 0;
+        let totalDownloadPending = 0;
+
+        for (const app of acceptedApps) {
+          const { bucketKey } = resolveCandidateBucket(app);
+          const bucket = bucketMap[bucketKey];
+          if (!bucket) continue;
+
+          totalAccepted++;
+          bucket.totalAccepted++;
+
+          const hasRoll = Boolean(app.exam_roll);
+          if (hasRoll) {
+            totalRollsAssigned++;
+            bucket.rollsAssigned++;
+            // Calculate max serial
+            const rollStr = String(app.exam_roll);
+            const serialPart = parseInt(rollStr.slice(-3), 10);
+            if (!isNaN(serialPart) && serialPart > bucket.maxSerial) {
+              bucket.maxSerial = serialPart;
+              bucket.maxRoll = rollStr;
+            }
+          } else {
+            totalRollsPending++;
+            bucket.rollsPending++;
+          }
+
+          const isDownloaded = Boolean(app.admit_card?.downloaded || app.admit_downloaded);
+          if (isDownloaded) {
+            totalDownloaded++;
+            bucket.admitDownloaded++;
+          } else {
+            totalDownloadPending++;
+            bucket.downloadPending++;
+          }
+        }
+
+        const buckets = Object.values(bucketMap);
+
+        res.send({
+          success: true,
+          stats: {
+            totalAccepted,
+            totalRollsAssigned,
+            totalRollsPending,
+            totalDownloaded,
+            totalDownloadPending,
+            admitCardLocked: Boolean(settings.admitCardLocked),
+            admitCardPublished: Boolean(settings.admitCardPublished),
+            admitCardLockedAt: settings.admitCardLockedAt || null,
+            admitCardPublishedAt: settings.admitCardPublishedAt || null,
+          },
+          buckets,
+        });
+      } catch (err) {
+        console.error("Exam rolls summary error:", err);
+        res.status(500).send({ message: "Failed to load exam rolls summary" });
+      }
+    });
+
+    // 2. POST /admin/exam-rolls/generate - Generate roll numbers
+    app.post('/admin/exam-rolls/generate', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const settings = await settingsCollection.findOne({}) || {};
+        if (settings.admitCardLocked) {
+          return res.status(403).send({
+            message: "রোল নম্বরগুলো লক করা আছে। রোল পরিবর্তন বা তৈরি করতে প্রথমে আনলক করুন।",
+          });
+        }
+
+        const { bucketKey: targetBucketKey } = req.body || {};
+
+        // Fetch all accepted applications
+        const query = { reg_status: "accepted" };
+        const acceptedApps = await applicationCollection.find(query).toArray();
+
+        // Group into buckets
+        const bucketBuckets = {};
+        for (const app of acceptedApps) {
+          const { bucketKey, center, studentClass, gender } = resolveCandidateBucket(app);
+          if (targetBucketKey && bucketKey !== targetBucketKey) {
+            continue;
+          }
+
+          if (!bucketBuckets[bucketKey]) {
+            bucketBuckets[bucketKey] = {
+              bucketKey,
+              center,
+              studentClass,
+              gender,
+              assignedMaxSerial: 0,
+              unassigned: [],
+            };
+          }
+
+          if (app.exam_roll) {
+            const serialPart = parseInt(String(app.exam_roll).slice(-3), 10);
+            if (!isNaN(serialPart) && serialPart > bucketBuckets[bucketKey].assignedMaxSerial) {
+              bucketBuckets[bucketKey].assignedMaxSerial = serialPart;
+            }
+          } else {
+            bucketBuckets[bucketKey].unassigned.push(app);
+          }
+        }
+
+        const bulkOps = [];
+        let totalGenerated = 0;
+
+        for (const bucketKey of Object.keys(bucketBuckets)) {
+          const bucket = bucketBuckets[bucketKey];
+          if (bucket.unassigned.length === 0) continue;
+
+          // Intelligent Sorting: strictly by Candidate Name (A-Z)
+          bucket.unassigned.sort((a, b) => {
+            const nameA = (a.name_en || "").trim().toUpperCase();
+            const nameB = (b.name_en || "").trim().toUpperCase();
+            return nameA.localeCompare(nameB);
+          });
+
+          let currentSerial = bucket.assignedMaxSerial;
+          for (const cand of bucket.unassigned) {
+            currentSerial++;
+            const rollStr = `${EXAM_YEAR}${bucket.center.code}${bucket.studentClass.code}${bucket.gender.code}${String(currentSerial).padStart(3, "0")}`;
+            bulkOps.push({
+              updateOne: {
+                filter: { _id: cand._id },
+                update: {
+                  $set: {
+                    exam_roll: rollStr,
+                    exam_roll_bucket: bucketKey,
+                    exam_roll_generated_at: new Date().toISOString(),
+                    exam_roll_generated_by: req.decoded?.email || "Admin",
+                  },
+                },
+              },
+            });
+            totalGenerated++;
+          }
+        }
+
+        if (bulkOps.length > 0) {
+          await applicationCollection.bulkWrite(bulkOps);
+        }
+
+        res.send({
+          success: true,
+          generatedCount: totalGenerated,
+          message: `${totalGenerated} জন শিক্ষার্থীর রোল নম্বর সফলভাবে তৈরি করা হয়েছে।`,
+        });
+      } catch (err) {
+        console.error("Generate rolls error:", err);
+        res.status(500).send({ message: "Failed to generate exam rolls" });
+      }
+    });
+
+    // 3. PATCH /admin/exam-rolls/lock - Lock or unlock rolls
+    app.patch('/admin/exam-rolls/lock', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const locked = Boolean(req.body.locked);
+        await settingsCollection.updateOne(
+          {},
+          {
+            $set: {
+              admitCardLocked: locked,
+              admitCardLockedAt: new Date().toISOString(),
+              admitCardLockedBy: req.decoded?.email || "Admin",
+            },
+          },
+          { upsert: true }
+        );
+        res.send({
+          success: true,
+          admitCardLocked: locked,
+          message: locked ? "রোল নম্বর সফলভাবে লক করা হয়েছে।" : "রোল নম্বর আনলক করা হয়েছে।",
+        });
+      } catch (err) {
+        console.error("Lock rolls error:", err);
+        res.status(500).send({ message: "Failed to update roll lock status" });
+      }
+    });
+
+    // 4. PATCH /admin/exam-rolls/publish - Publish or unpublish admit cards
+    app.patch('/admin/exam-rolls/publish', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const published = Boolean(req.body.published);
+        await settingsCollection.updateOne(
+          {},
+          {
+            $set: {
+              admitCardPublished: published,
+              admitCardPublishedAt: new Date().toISOString(),
+              admitCardPublishedBy: req.decoded?.email || "Admin",
+            },
+          },
+          { upsert: true }
+        );
+        res.send({
+          success: true,
+          admitCardPublished: published,
+          message: published ? "অ্যাডমিট কার্ড সফলভাবে প্রকাশিত হয়েছে!" : "অ্যাডমিট কার্ড প্রকাশনা স্থগিত করা হয়েছে।",
+        });
+      } catch (err) {
+        console.error("Publish admit cards error:", err);
+        res.status(500).send({ message: "Failed to update admit card publication status" });
+      }
+    });
+
+    // 5. GET /admin/exam-rolls/candidates - Candidates within bucket or search
+    app.get('/admin/exam-rolls/candidates', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const { bucketKey, center, student_class, gender, search, roll_status, page = 1, limit = 50 } = req.query;
+
+        const filter = { reg_status: "accepted" };
+
+        if (bucketKey) {
+          filter.exam_roll_bucket = bucketKey;
+        }
+        if (center && center !== "all") {
+          filter.exam_center = center;
+        }
+        if (student_class && student_class !== "all") {
+          filter.student_class = student_class;
+        }
+        if (gender && gender !== "all") {
+          filter.gender = gender;
+        }
+        if (roll_status === "assigned") {
+          filter.exam_roll = { $exists: true, $nin: [null, ""] };
+        } else if (roll_status === "pending") {
+          filter.$or = [{ exam_roll: { $exists: false } }, { exam_roll: null }, { exam_roll: "" }];
+        }
+
+        if (search && search.trim()) {
+          const q = search.trim();
+          filter.$or = [
+            { name_en: { $regex: q, $options: "i" } },
+            { name_bn: { $regex: q, $options: "i" } },
+            { exam_roll: { $regex: q, $options: "i" } },
+            { phone_number: { $regex: q, $options: "i" } },
+            { school_name: { $regex: q, $options: "i" } },
+            { form_number: { $regex: q, $options: "i" } },
+          ];
+        }
+
+        const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+        const [candidates, total] = await Promise.all([
+          applicationCollection
+            .find(filter)
+            .sort({ exam_roll: 1, name_en: 1 })
+            .skip(skip)
+            .limit(parseInt(limit, 10))
+            .project({
+              _id: 1,
+              name_en: 1,
+              name_bn: 1,
+              student_class: 1,
+              student_section: 1,
+              student_roll: 1,
+              school_name: 1,
+              phone_number: 1,
+              exam_center: 1,
+              gender: 1,
+              exam_roll: 1,
+              exam_roll_bucket: 1,
+              admit_card: 1,
+              admit_downloaded: 1,
+              registration_type: 1,
+              paper_serial_no: 1,
+              form_number: 1,
+            })
+            .toArray(),
+          applicationCollection.countDocuments(filter),
+        ]);
+
+        res.send({
+          success: true,
+          candidates,
+          total,
+          page: parseInt(page, 10),
+          totalPages: Math.ceil(total / parseInt(limit, 10)),
+        });
+      } catch (err) {
+        console.error("Fetch roll candidates error:", err);
+        res.status(500).send({ message: "Failed to fetch candidates" });
+      }
+    });
+
+    // 6. GET /admin/exam-centers/allocation - Center & Venue Allocation with live capacity tracking
+    app.get('/admin/exam-centers/allocation', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const settings = await settingsCollection.findOne({}) || {};
+        const savedAllocations = settings.exam_center_allocations || {};
+
+        // Aggregate accepted candidates per center
+        const acceptedApps = await applicationCollection
+          .find({ reg_status: "accepted" })
+          .project({ exam_center: 1 })
+          .toArray();
+
+        const candidateCountMap = {
+          chawkbazar: 0,
+          chandgaon: 0,
+          kotwali: 0,
+          nasirabad: 0,
+          bayezid: 0,
+        };
+
+        for (const app of acceptedApps) {
+          const raw = (app.exam_center || "chawkbazar").toString().trim().toLowerCase();
+          const matched = CENTER_LOOKUP[raw] || EXAM_CENTERS[0];
+          candidateCountMap[matched.key] = (candidateCountMap[matched.key] || 0) + 1;
+        }
+
+        let overallCandidates = 0;
+        let overallCapacity = 0;
+
+        const centers = EXAM_CENTERS.map((c) => {
+          const centerKey = c.key;
+          const totalCandidates = candidateCountMap[centerKey] || 0;
+          overallCandidates += totalCandidates;
+
+          const centerSaved = savedAllocations[centerKey] || {};
+          const rawVenues = Array.isArray(centerSaved.venues) ? centerSaved.venues : [];
+
+          let runningSeq = 0;
+          let centerCapacity = 0;
+
+          const venues = rawVenues.map((v, idx) => {
+            const cap = Math.max(0, parseInt(v.capacity, 10) || 0);
+            centerCapacity += cap;
+
+            const startSeq = runningSeq + 1;
+            const endSeq = startSeq + cap - 1;
+            runningSeq = endSeq;
+
+            return {
+              id: v.id || `v_${idx + 1}`,
+              name_bn: v.name_bn || "",
+              name_en: v.name_en || "",
+              address_bn: v.address_bn || "",
+              address_en: v.address_en || "",
+              capacity: cap,
+              startSeq,
+              endSeq,
+              assignedCount: Math.min(cap, Math.max(0, totalCandidates - (startSeq - 1))),
+            };
+          });
+
+          overallCapacity += centerCapacity;
+          const shortage = Math.max(0, totalCandidates - centerCapacity);
+          const surplus = Math.max(0, centerCapacity - totalCandidates);
+          const hasVenues = venues.length > 0;
+          const isOverCapacity = hasVenues && centerCapacity < totalCandidates;
+
+          let status = "no_venue";
+          if (hasVenues) {
+            status = isOverCapacity ? "shortage" : "adequate";
+          }
+
+          return {
+            centerKey,
+            centerCode: c.code,
+            centerLabelBn: c.label_bn,
+            centerLabelEn: c.label_en,
+            totalCandidates,
+            centerCapacity,
+            shortage,
+            surplus,
+            isOverCapacity,
+            status,
+            venues,
+          };
+        });
+
+        res.send({
+          success: true,
+          totalCenters: centers.length,
+          overallCandidates,
+          overallCapacity,
+          overallShortage: Math.max(0, overallCandidates - overallCapacity),
+          updatedAt: settings.exam_center_allocations_updatedAt || null,
+          updatedBy: settings.exam_center_allocations_updatedBy || null,
+          centers,
+        });
+      } catch (err) {
+        console.error("Exam center allocation get error:", err);
+        res.status(500).send({ message: "Failed to load exam center allocation" });
+      }
+    });
+
+    // 7. POST /admin/exam-centers/allocation - Save Center & Venue Allocation
+    app.post('/admin/exam-centers/allocation', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const { allocations } = req.body || {};
+        if (!allocations || typeof allocations !== "object") {
+          return res.status(400).send({ message: "Invalid allocations payload" });
+        }
+
+        // Clean & sanitize allocations
+        const sanitized = {};
+        for (const center of EXAM_CENTERS) {
+          const cData = allocations[center.key] || {};
+          const venues = Array.isArray(cData.venues) ? cData.venues : [];
+
+          sanitized[center.key] = {
+            venues: venues.map((v, idx) => ({
+              id: v.id || `v_${Date.now()}_${idx + 1}`,
+              name_bn: (v.name_bn || "").trim(),
+              name_en: (v.name_en || "").trim(),
+              address_bn: (v.address_bn || "").trim(),
+              address_en: (v.address_en || "").trim(),
+              capacity: Math.max(0, parseInt(v.capacity, 10) || 0),
+            })),
+          };
+        }
+
+        await settingsCollection.updateOne(
+          {},
+          {
+            $set: {
+              exam_center_allocations: sanitized,
+              exam_center_allocations_updatedAt: new Date().toISOString(),
+              exam_center_allocations_updatedBy: req.decoded?.email || "Admin",
+            },
+          },
+          { upsert: true }
+        );
+
+        res.send({
+          success: true,
+          message: "পরীক্ষা কেন্দ্র ও ভেন্যু বরাদ্দ সফলভাবে সংরক্ষণ করা হয়েছে।",
+        });
+      } catch (err) {
+        console.error("Exam center allocation save error:", err);
+        res.status(500).send({ message: "Failed to save exam center allocation" });
+      }
+    });
+
+    // 8. GET /admin/admit-card/config - Fetch admit card instructions, signature & schedule setup
+    app.get('/admin/admit-card/config', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const settings = await settingsCollection.findOne({}) || {};
+        const DEFAULT_ADMIT_CONFIG = {
+          exam_title: "অঙ্কুর মেধা বৃত্তি পরীক্ষা ২০২৬",
+          exam_subtitle: "Aunkur Scholarship Examination 2026",
+          exam_date: "ডিসেম্বর ২০২৬",
+          exam_date_en: "December 2026",
+          exam_time: "সকাল ১০:০০ টা – দুপুর ১২:৩০ টা",
+          exam_time_en: "10:00 AM – 12:30 PM",
+          reporting_time: "সকাল ৯:৩০ টা",
+          reporting_time_en: "9:30 AM",
+          instructions: [
+            "পরীক্ষার্থীকে পরীক্ষা শুরুর অন্তত ৩০ মিনিট পূর্বে নিজ আসনে উপস্থিত হতে হবে।",
+            "মূল প্রবেশপত্র (Admit Card) ব্যতীত কোনো পরীক্ষার্থীকে পরীক্ষা কক্ষে প্রবেশ করতে দেওয়া হবে না।",
+            "পরীক্ষার হলে যেকোনো ধরণের মোবাইল ফোন, স্মার্টওয়াচ বা ইলেকট্রনিক ডিভাইস আনা সম্পূর্ণ নিষিদ্ধ।",
+            "উত্তরপত্রে প্রার্থীর নাম, রোল নম্বর ও প্রয়োজনীয় তথ্য সতর্কতার সাথে বলপেন দ্বারা পূরণ করতে হবে।",
+            "পরীক্ষা কক্ষ ত্যাগের পূর্বে উত্তরপত্র পরিদর্শকের নিকট জমা দিয়ে নিশ্চিত করতে হবে।"
+          ],
+          controller_name: "পরীক্ষা নিয়ন্ত্রক",
+          controller_name_en: "Exam Controller",
+          controller_designation: "আহ্বায়ক, পরীক্ষা উপ-কমিটি",
+          controller_designation_en: "Convener, Examination Sub-Committee",
+          controller_signature_url: "",
+          helpline_number: "01879891623",
+          emergency_instructions: "যেকোনো জরুরি প্রয়োজনে হটলাইন নম্বরে যোগাযোগ করুন।"
+        };
+
+        const config = { ...DEFAULT_ADMIT_CONFIG, ...(settings.admit_card_config || {}) };
+        res.send({ success: true, config });
+      } catch (err) {
+        console.error("Fetch admit card config error:", err);
+        res.status(500).send({ message: "Failed to load admit card setup" });
+      }
+    });
+
+    // 9. POST /admin/admit-card/config - Save admit card instructions, signature & schedule setup
+    app.post('/admin/admit-card/config', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const { config } = req.body || {};
+        if (!config || typeof config !== "object") {
+          return res.status(400).send({ message: "Invalid config payload" });
+        }
+
+        // Sanitize instructions array
+        const instructions = Array.isArray(config.instructions)
+          ? config.instructions.map((item) => String(item || "").trim()).filter(Boolean)
+          : [];
+
+        const sanitized = {
+          exam_title: (config.exam_title || "").trim(),
+          exam_subtitle: (config.exam_subtitle || "").trim(),
+          exam_date: (config.exam_date || "").trim(),
+          exam_date_en: (config.exam_date_en || "").trim(),
+          exam_time: (config.exam_time || "").trim(),
+          exam_time_en: (config.exam_time_en || "").trim(),
+          reporting_time: (config.reporting_time || "").trim(),
+          reporting_time_en: (config.reporting_time_en || "").trim(),
+          instructions,
+          controller_name: (config.controller_name || "").trim(),
+          controller_name_en: (config.controller_name_en || "").trim(),
+          controller_designation: (config.controller_designation || "").trim(),
+          controller_designation_en: (config.controller_designation_en || "").trim(),
+          controller_signature_url: (config.controller_signature_url || "").trim(),
+          helpline_number: (config.helpline_number || "").trim(),
+          emergency_instructions: (config.emergency_instructions || "").trim(),
+        };
+
+        await settingsCollection.updateOne(
+          {},
+          {
+            $set: {
+              admit_card_config: sanitized,
+              admit_card_config_updatedAt: new Date().toISOString(),
+              admit_card_config_updatedBy: req.decoded?.email || "Admin",
+            },
+          },
+          { upsert: true }
+        );
+
+        res.send({
+          success: true,
+          message: "প্রবেশপত্রের নির্দেশনাবলী, সময়সূচি ও স্বাক্ষর সফলভাবে সংরক্ষণ করা হয়েছে।",
+          config: sanitized,
+        });
+      } catch (err) {
+        console.error("Save admit card config error:", err);
+        res.status(500).send({ message: "Failed to save admit card setup" });
+      }
+    });
+
     app.get('/registrations', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       const result = await applicationCollection.find().toArray()
       res.send(result)
