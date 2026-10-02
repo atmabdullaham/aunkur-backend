@@ -134,16 +134,20 @@ async function run() {
     const studentOfTheYearCollection = database.collection("student_of_the_year");
     const countersCollection = database.collection("counters");
 
-    // Ensure critical database indexes for high-speed lookups and duplicate prevention
+    // Ensure critical database indexes for high-speed lookups (Non-blocking background execution)
+    let indexesAlreadyEnsured = false;
     const ensureIndexes = async () => {
+      if (indexesAlreadyEnsured) return;
+      indexesAlreadyEnsured = true;
       const indexTasks = [
-        () => applicationCollection.createIndex({ phone_number: 1 }),
-        () => applicationCollection.createIndex({ exam_roll: 1 }, { sparse: true }),
-        () => applicationCollection.createIndex({ transaction_Id: 1 }, { sparse: true }),
-        () => applicationCollection.createIndex({ registration_type: 1, reg_status: 1 }),
-        () => applicationCollection.createIndex({ form_number: 1 }, { sparse: true }),
-        () => applicationCollection.createIndex({ offline_serial: 1 }, { sparse: true }),
-        () => userCollection.createIndex({ email: 1 }, { unique: true }),
+        () => applicationCollection.createIndex({ phone_number: 1 }, { background: true }),
+        () => applicationCollection.createIndex({ exam_roll: 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex({ reg_status: 1 }, { background: true }),
+        () => applicationCollection.createIndex({ transaction_Id: 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex({ registration_type: 1, reg_status: 1 }, { background: true }),
+        () => applicationCollection.createIndex({ form_number: 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex({ offline_serial: 1 }, { sparse: true, background: true }),
+        () => userCollection.createIndex({ email: 1 }, { unique: true, background: true }),
       ];
 
       for (const task of indexTasks) {
@@ -154,7 +158,7 @@ async function run() {
         }
       }
     };
-    ensureIndexes();
+    setImmediate(ensureIndexes);
 
     // Center-wise Numeric Serial Configuration:
     // Chawkbazar: 1001-1999 (base 1000)
@@ -2304,6 +2308,8 @@ async function run() {
           controller_designation: "আহ্বায়ক, পরীক্ষা উপ-কমিটি",
           controller_designation_en: "Convener, Examination Sub-Committee",
           controller_signature_url: "",
+          contact_north: "01879-891623, 01805-210314, 01878-284427",
+          slogan: "শুভ্রতার স্পর্শে লালিত স্বপ্ন বিকশিত হোক সত্যের ছোঁয়ায়",
           helpline_number: "01879891623",
           emergency_instructions: "যেকোনো জরুরি প্রয়োজনে হটলাইন নম্বরে যোগাযোগ করুন।",
           sms_template: "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
@@ -2353,6 +2359,8 @@ async function run() {
           controller_designation: (config.controller_designation || "").trim(),
           controller_designation_en: (config.controller_designation_en || "").trim(),
           controller_signature_url: (config.controller_signature_url || "").trim(),
+          contact_north: (config.contact_north || "").trim() || "01879-891623, 01805-210314, 01878-284427",
+          slogan: (config.slogan || "").trim() || "শুভ্রতার স্পর্শে লালিত স্বপ্ন বিকশিত হোক সত্যের ছোঁয়ায়",
           helpline_number: (config.helpline_number || "").trim(),
           emergency_instructions: (config.emergency_instructions || "").trim(),
           sms_template: (config.sms_template || "").trim() || "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
