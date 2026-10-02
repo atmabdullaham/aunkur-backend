@@ -134,6 +134,28 @@ async function run() {
     const studentOfTheYearCollection = database.collection("student_of_the_year");
     const countersCollection = database.collection("counters");
 
+    // Ensure critical database indexes for high-speed lookups and duplicate prevention
+    const ensureIndexes = async () => {
+      const indexTasks = [
+        () => applicationCollection.createIndex({ phone_number: 1 }),
+        () => applicationCollection.createIndex({ exam_roll: 1 }, { sparse: true }),
+        () => applicationCollection.createIndex({ transaction_Id: 1 }, { sparse: true }),
+        () => applicationCollection.createIndex({ registration_type: 1, reg_status: 1 }),
+        () => applicationCollection.createIndex({ form_number: 1 }, { sparse: true }),
+        () => applicationCollection.createIndex({ offline_serial: 1 }, { sparse: true }),
+        () => userCollection.createIndex({ email: 1 }, { unique: true }),
+      ];
+
+      for (const task of indexTasks) {
+        try {
+          await task();
+        } catch (idxErr) {
+          console.warn("⚠️ Database index creation notice:", idxErr.message);
+        }
+      }
+    };
+    ensureIndexes();
+
     // Center-wise Numeric Serial Configuration:
     // Chawkbazar: 1001-1999 (base 1000)
     // Chandgaon:  2001-2999 (base 2000)
@@ -300,6 +322,44 @@ async function run() {
       }
       next()
     }
+
+    // Helper to check if a request has a valid admin token (used for public endpoint bypass)
+    const checkIsAdminRequest = async (req) => {
+      try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) return false;
+        const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : authHeader;
+        if (!token || token === 'null' || token === 'undefined') return false;
+
+        const decoded = await new Promise((resolve) => {
+          jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, d) => {
+            if (err) resolve(null);
+            else resolve(d);
+          });
+        });
+        if (!decoded?.email) return false;
+        const user = await userCollection.findOne({ email: decoded.email });
+        return user?.role === "admin";
+      } catch (e) {
+        return false;
+      }
+    };
+
+    // Helper to check if admit cards are currently published for the public
+    const isAdmitCardCurrentlyPublished = (admitConfig) => {
+      if (!admitConfig) return false;
+      if (admitConfig.admit_card_published === false) return false;
+      if (admitConfig.admit_card_publish_status === "draft") return false;
+
+      if (admitConfig.admit_card_publish_status === "scheduled") {
+        if (!admitConfig.publish_date_time) return false;
+        const target = new Date(admitConfig.publish_date_time).getTime();
+        if (isNaN(target)) return false;
+        return Date.now() >= target;
+      }
+
+      return Boolean(admitConfig.admit_card_published !== false);
+    };
 
     // Middleware to verify coordinator or admin role
     const verifyCoordinatorOrAdmin = async (req, res, next) => {
@@ -964,7 +1024,19 @@ async function run() {
       }
     });
 
-    app.post('/applications', async (req, res) => {
+    // Online registration limiter - max 10 submissions per IP per hour to prevent bot spam and SMS balance exhaustion
+    const onlineRegistrationLimiter = rateLimit({
+      windowMs: 60 * 60 * 1000,
+      limit: 10,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: {
+        success: false,
+        message: "একটি নির্দিষ্ট আইপি থেকে অতিরিক্ত আবেদন করা হয়েছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।"
+      }
+    });
+
+    app.post('/applications', onlineRegistrationLimiter, async (req, res) => {
       // ✅ Guard: Check if registration is currently open
       try {
         const settings = await getSettings();
@@ -979,11 +1051,29 @@ async function run() {
         return res.status(500).send({ message: "Server error checking settings" });
       }
 
-      const application = req.body;
+      const application = { ...(req.body || {}) };
+
+      // Prevent mass-assignment / privilege escalation from untrusted client
+      delete application._id;
+      delete application.reg_status;
+      delete application.exam_roll;
+      delete application.admit_sms;
+      delete application.admit_downloaded;
+      delete application.allocated_venue;
+      delete application.offline_serial;
+      delete application.paper_serial_no;
+      delete application.created_by;
+      delete application.admin_note;
+      delete application.office_note;
+
+      // Enforce immutable server values for online submissions
+      application.registration_type = "online";
+      application.reg_status = "under_review";
+      application.submittedAt = new Date().toISOString();
 
       // ✅ Guard: Duplicate Transaction ID check
       if (application.transaction_Id) {
-        const txnId = application.transaction_Id.trim();
+        const txnId = String(application.transaction_Id).trim();
         const escapedTxnId = txnId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const existingTxn = await applicationCollection.findOne({
           transaction_Id: { $regex: new RegExp(`^${escapedTxnId}$`, "i") }
@@ -1607,8 +1697,74 @@ async function run() {
       return { center, studentClass, gender, bucketKey };
     };
 
+    const resolveCandidateVenue = (cand, allocations = {}) => {
+      const { center: matchedCenter } = resolveCandidateBucket(cand);
+      const centerData = allocations[matchedCenter.key] || {};
+      const venues = Array.isArray(centerData.venues) ? centerData.venues : [];
+
+      if (venues.length === 0) {
+        return {
+          name_bn: `${matchedCenter.label_bn} কেন্দ্র`,
+          name_en: `${matchedCenter.label_en} Center`,
+          address_bn: `${matchedCenter.label_bn}, চট্টগ্রাম`,
+          address_en: `${matchedCenter.label_en}, Chattogram`,
+        };
+      }
+
+      if (venues.length === 1) {
+        const v = venues[0];
+        return {
+          name_bn: v.name_bn || `${matchedCenter.label_bn} কেন্দ্র`,
+          name_en: v.name_en || `${matchedCenter.label_en} Center`,
+          address_bn: v.address_bn || `${matchedCenter.label_bn}, চট্টগ্রাম`,
+          address_en: v.address_en || `${matchedCenter.label_en}, Chattogram`,
+        };
+      }
+
+      const rollStr = String(cand.exam_roll || "");
+      const serialPart = parseInt(rollStr.slice(-3), 10) || 1;
+      let running = 0;
+      for (const v of venues) {
+        const cap = parseInt(v.capacity, 10) || 0;
+        if (serialPart <= running + cap || v === venues[venues.length - 1]) {
+          return {
+            name_bn: v.name_bn || `${matchedCenter.label_bn} কেন্দ্র`,
+            name_en: v.name_en || `${matchedCenter.label_en} Center`,
+            address_bn: v.address_bn || `${matchedCenter.label_bn}, চট্টগ্রাম`,
+            address_en: v.address_en || `${matchedCenter.label_en}, Chattogram`,
+          };
+        }
+        running += cap;
+      }
+      return venues[0];
+    };
+
+    const formatClassNumber = (cls) => {
+      const map = {
+        four: "4", five: "5", six: "6", seven: "7", eight: "8", nine: "9", ten: "10",
+        "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9", "10": "10"
+      };
+      return map[String(cls || "").toLowerCase()] || cls || "8";
+    };
+
+    const formatSmsMessage = (template, cand) => {
+      const lastName = formatLastName(cand.name_en || cand.name_bn || "Candidate");
+      const fullName = (cand.name_en || cand.name_bn || "Candidate").trim();
+      const roll = cand.exam_roll || "";
+      const cls = formatClassNumber(cand.student_class);
+      const link = "aunkurctgnorth.org/admitcard";
+      const tmpl = template || "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: {link} - Aunkur'26";
+      return tmpl
+        .replace(/{last_name}/g, lastName)
+        .replace(/{name}/g, lastName)
+        .replace(/{full_name}/g, fullName)
+        .replace(/{roll}/g, roll)
+        .replace(/{class}/g, cls)
+        .replace(/{link}/g, link);
+    };
+
     // 1. GET /admin/exam-rolls/summary - Bucket matrix and overall roll stats
-    app.get('/admin/exam-rolls/summary', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.get('/admin/exam-rolls/summary', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const settings = await settingsCollection.findOne({}) || {};
         const acceptedApps = await applicationCollection
@@ -1649,6 +1805,9 @@ async function run() {
                 totalAccepted: 0,
                 rollsAssigned: 0,
                 rollsPending: 0,
+                smsSent: 0,
+                smsPending: 0,
+                smsFailed: 0,
                 admitDownloaded: 0,
                 downloadPending: 0,
                 maxRoll: null,
@@ -1661,6 +1820,9 @@ async function run() {
         let totalAccepted = 0;
         let totalRollsAssigned = 0;
         let totalRollsPending = 0;
+        let totalSmsSent = 0;
+        let totalSmsPending = 0;
+        let totalSmsFailed = 0;
         let totalDownloaded = 0;
         let totalDownloadPending = 0;
 
@@ -1682,6 +1844,18 @@ async function run() {
             if (!isNaN(serialPart) && serialPart > bucket.maxSerial) {
               bucket.maxSerial = serialPart;
               bucket.maxRoll = rollStr;
+            }
+
+            // SMS tracking for candidates with generated rolls
+            if (app.admit_sms?.sent) {
+              totalSmsSent++;
+              bucket.smsSent++;
+            } else if (app.admit_sms?.failed || app.admit_sms?.error) {
+              totalSmsFailed++;
+              bucket.smsFailed++;
+            } else {
+              totalSmsPending++;
+              bucket.smsPending++;
             }
           } else {
             totalRollsPending++;
@@ -1706,6 +1880,9 @@ async function run() {
             totalAccepted,
             totalRollsAssigned,
             totalRollsPending,
+            totalSmsSent,
+            totalSmsPending,
+            totalSmsFailed,
             totalDownloaded,
             totalDownloadPending,
             admitCardLocked: Boolean(settings.admitCardLocked),
@@ -1722,7 +1899,7 @@ async function run() {
     });
 
     // 2. POST /admin/exam-rolls/generate - Generate roll numbers
-    app.post('/admin/exam-rolls/generate', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.post('/admin/exam-rolls/generate', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const settings = await settingsCollection.findOne({}) || {};
         if (settings.admitCardLocked) {
@@ -1817,7 +1994,7 @@ async function run() {
     });
 
     // 3. PATCH /admin/exam-rolls/lock - Lock or unlock rolls
-    app.patch('/admin/exam-rolls/lock', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.patch('/admin/exam-rolls/lock', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const locked = Boolean(req.body.locked);
         await settingsCollection.updateOne(
@@ -1843,7 +2020,7 @@ async function run() {
     });
 
     // 4. PATCH /admin/exam-rolls/publish - Publish or unpublish admit cards
-    app.patch('/admin/exam-rolls/publish', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.patch('/admin/exam-rolls/publish', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const published = Boolean(req.body.published);
         await settingsCollection.updateOne(
@@ -1851,6 +2028,8 @@ async function run() {
           {
             $set: {
               admitCardPublished: published,
+              "admit_card_config.admit_card_published": published,
+              "admit_card_config.admit_card_publish_status": published ? "published" : "draft",
               admitCardPublishedAt: new Date().toISOString(),
               admitCardPublishedBy: req.decoded?.email || "Admin",
             },
@@ -1869,7 +2048,7 @@ async function run() {
     });
 
     // 5. GET /admin/exam-rolls/candidates - Candidates within bucket or search
-    app.get('/admin/exam-rolls/candidates', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.get('/admin/exam-rolls/candidates', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { bucketKey, center, student_class, gender, search, roll_status, page = 1, limit = 50 } = req.query;
 
@@ -1925,6 +2104,7 @@ async function run() {
               gender: 1,
               exam_roll: 1,
               exam_roll_bucket: 1,
+              admit_sms: 1,
               admit_card: 1,
               admit_downloaded: 1,
               registration_type: 1,
@@ -1949,7 +2129,7 @@ async function run() {
     });
 
     // 6. GET /admin/exam-centers/allocation - Center & Venue Allocation with live capacity tracking
-    app.get('/admin/exam-centers/allocation', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.get('/admin/exam-centers/allocation', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const settings = await settingsCollection.findOne({}) || {};
         const savedAllocations = settings.exam_center_allocations || {};
@@ -2052,7 +2232,7 @@ async function run() {
     });
 
     // 7. POST /admin/exam-centers/allocation - Save Center & Venue Allocation
-    app.post('/admin/exam-centers/allocation', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.post('/admin/exam-centers/allocation', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { allocations } = req.body || {};
         if (!allocations || typeof allocations !== "object") {
@@ -2100,11 +2280,11 @@ async function run() {
     });
 
     // 8. GET /admin/admit-card/config - Fetch admit card instructions, signature & schedule setup
-    app.get('/admin/admit-card/config', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.get('/admin/admit-card/config', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const settings = await settingsCollection.findOne({}) || {};
         const DEFAULT_ADMIT_CONFIG = {
-          exam_title: "অঙ্কুর মেধা বৃত্তি পরীক্ষা ২০২৬",
+          exam_title: "অংকুর মেধা বৃত্তি পরীক্ষা ২০২৬",
           exam_subtitle: "Aunkur Scholarship Examination 2026",
           exam_date: "ডিসেম্বর ২০২৬",
           exam_date_en: "December 2026",
@@ -2125,7 +2305,12 @@ async function run() {
           controller_designation_en: "Convener, Examination Sub-Committee",
           controller_signature_url: "",
           helpline_number: "01879891623",
-          emergency_instructions: "যেকোনো জরুরি প্রয়োজনে হটলাইন নম্বরে যোগাযোগ করুন।"
+          emergency_instructions: "যেকোনো জরুরি প্রয়োজনে হটলাইন নম্বরে যোগাযোগ করুন।",
+          sms_template: "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
+          admit_card_published: true,
+          admit_card_publish_status: "published", // "published" | "scheduled" | "draft"
+          publish_date_time: "", // e.g. "2026-10-15T10:00"
+          publish_notice: "",
         };
 
         const config = { ...DEFAULT_ADMIT_CONFIG, ...(settings.admit_card_config || {}) };
@@ -2137,7 +2322,7 @@ async function run() {
     });
 
     // 9. POST /admin/admit-card/config - Save admit card instructions, signature & schedule setup
-    app.post('/admin/admit-card/config', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+    app.post('/admin/admit-card/config', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { config } = req.body || {};
         if (!config || typeof config !== "object") {
@@ -2148,6 +2333,10 @@ async function run() {
         const instructions = Array.isArray(config.instructions)
           ? config.instructions.map((item) => String(item || "").trim()).filter(Boolean)
           : [];
+
+        const publishStatus = ["published", "scheduled", "draft"].includes(config.admit_card_publish_status)
+          ? config.admit_card_publish_status
+          : (config.admit_card_published === false ? "draft" : "published");
 
         const sanitized = {
           exam_title: (config.exam_title || "").trim(),
@@ -2166,6 +2355,11 @@ async function run() {
           controller_signature_url: (config.controller_signature_url || "").trim(),
           helpline_number: (config.helpline_number || "").trim(),
           emergency_instructions: (config.emergency_instructions || "").trim(),
+          sms_template: (config.sms_template || "").trim() || "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
+          admit_card_published: Boolean(config.admit_card_published !== false && publishStatus !== "draft"),
+          admit_card_publish_status: publishStatus,
+          publish_date_time: (config.publish_date_time || "").trim(),
+          publish_notice: (config.publish_notice || "").trim(),
         };
 
         await settingsCollection.updateOne(
@@ -2173,6 +2367,7 @@ async function run() {
           {
             $set: {
               admit_card_config: sanitized,
+              admitCardPublished: sanitized.admit_card_published,
               admit_card_config_updatedAt: new Date().toISOString(),
               admit_card_config_updatedBy: req.decoded?.email || "Admin",
             },
@@ -2188,6 +2383,748 @@ async function run() {
       } catch (err) {
         console.error("Save admit card config error:", err);
         res.status(500).send({ message: "Failed to save admit card setup" });
+      }
+    });
+
+    // 10. GET /admin/admit-cards/list - Paginated list of candidates for admit card management
+    app.get('/admin/admit-cards/list', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const {
+          center,
+          student_class,
+          gender,
+          branch,
+          sub_branch,
+          registration_type,
+          reg_type,
+          download_status,
+          sms_status,
+          search,
+          page = 1,
+          limit = 50,
+        } = req.query;
+
+        const settings = await settingsCollection.findOne({}) || {};
+        const allocations = settings.exam_center_allocations || {};
+
+        const filter = {
+          reg_status: "accepted",
+          exam_roll: { $exists: true, $nin: [null, ""] },
+        };
+
+        if (center && center !== "all") {
+          filter.exam_center = center;
+        }
+        if (student_class && student_class !== "all") {
+          filter.student_class = student_class;
+        }
+        if (gender && gender !== "all") {
+          filter.gender = gender;
+        }
+        if (branch && branch !== "all") {
+          filter.branch = branch;
+        }
+        if (sub_branch && sub_branch !== "all") {
+          filter.sub_branch = sub_branch;
+        }
+        const selectedRegType = registration_type || reg_type;
+        if (selectedRegType === "offline") {
+          filter.registration_type = "offline";
+        } else if (selectedRegType === "online") {
+          filter.registration_type = { $ne: "offline" };
+        }
+
+        if (download_status === "downloaded") {
+          filter.$or = [{ admit_downloaded: true }, { "admit_card.downloaded": true }];
+        } else if (download_status === "pending") {
+          filter.admit_downloaded = { $ne: true };
+          filter["admit_card.downloaded"] = { $ne: true };
+        }
+
+        if (sms_status === "sent") {
+          filter["admit_sms.sent"] = true;
+        } else if (sms_status === "pending") {
+          filter["admit_sms.sent"] = { $ne: true };
+        }
+
+        if (search && search.trim()) {
+          const q = search.trim();
+          const searchConditions = [
+            { name_en: { $regex: q, $options: "i" } },
+            { name_bn: { $regex: q, $options: "i" } },
+            { exam_roll: { $regex: q, $options: "i" } },
+            { phone_number: { $regex: q, $options: "i" } },
+            { school_name: { $regex: q, $options: "i" } },
+            { form_number: { $regex: q, $options: "i" } },
+          ];
+          if (filter.$or) {
+            filter.$and = [{ $or: filter.$or }, { $or: searchConditions }];
+            delete filter.$or;
+          } else {
+            filter.$or = searchConditions;
+          }
+        }
+
+        const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+        const [candidates, total, statsDownloaded, statsPending, statsSmsSent, statsSmsPending] = await Promise.all([
+          applicationCollection
+            .find(filter)
+            .sort({ exam_roll: 1, name_en: 1 })
+            .skip(skip)
+            .limit(parseInt(limit, 10))
+            .toArray(),
+          applicationCollection.countDocuments(filter),
+          applicationCollection.countDocuments({
+            reg_status: "accepted",
+            exam_roll: { $exists: true, $nin: [null, ""] },
+            $or: [{ admit_downloaded: true }, { "admit_card.downloaded": true }],
+          }),
+          applicationCollection.countDocuments({
+            reg_status: "accepted",
+            exam_roll: { $exists: true, $nin: [null, ""] },
+            admit_downloaded: { $ne: true },
+            "admit_card.downloaded": { $ne: true },
+          }),
+          applicationCollection.countDocuments({
+            reg_status: "accepted",
+            exam_roll: { $exists: true, $nin: [null, ""] },
+            "admit_sms.sent": true,
+          }),
+          applicationCollection.countDocuments({
+            reg_status: "accepted",
+            exam_roll: { $exists: true, $nin: [null, ""] },
+            "admit_sms.sent": { $ne: true },
+          }),
+        ]);
+
+        const enrichedCandidates = candidates.map((cand) => {
+          const venue = resolveCandidateVenue(cand, allocations);
+          const isDownloaded = Boolean(cand.admit_card?.downloaded || cand.admit_downloaded);
+          return {
+            _id: cand._id,
+            name_en: cand.name_en || "",
+            name_bn: cand.name_bn || "",
+            father_name: cand.father_name || "",
+            mother_name: cand.mother_name || "",
+            gender: (cand.gender || "male").toLowerCase(),
+            student_class: cand.student_class || "",
+            student_section: cand.student_section || "",
+            student_roll: cand.student_roll || "",
+            school_name: cand.school_name || "",
+            phone_number: cand.phone_number || "",
+            whatsapp_number: cand.whatsapp_number || "",
+            present_area: cand.present_area || "",
+            present_thana: cand.present_thana || "",
+            present_zilla: cand.present_zilla || "",
+            form_number: cand.form_number || cand.paper_serial_no || cand.offline_serial || "",
+            exam_center: cand.exam_center || "",
+            exam_roll: cand.exam_roll || "",
+            exam_roll_bucket: cand.exam_roll_bucket || "",
+            branch: cand.branch || "",
+            sub_branch: cand.sub_branch || "",
+            registration_type: cand.registration_type === "offline" ? "offline" : "online",
+            admit_downloaded: isDownloaded,
+            admit_downloaded_at: cand.admit_card?.downloadedAt || null,
+            admit_sms: cand.admit_sms || null,
+            allocated_venue: venue,
+          };
+        });
+
+        res.send({
+          success: true,
+          candidates: enrichedCandidates,
+          total,
+          page: parseInt(page, 10),
+          totalPages: Math.ceil(total / parseInt(limit, 10)),
+          stats: {
+            totalEligible: statsDownloaded + statsPending,
+            totalDownloaded: statsDownloaded,
+            totalDownloadPending: statsPending,
+            totalSmsSent: statsSmsSent,
+            totalSmsPending: statsSmsPending,
+            admitCardLocked: Boolean(settings.admitCardLocked),
+            admitCardPublished: Boolean(settings.admitCardPublished),
+          },
+        });
+      } catch (err) {
+        console.error("Admit cards list error:", err);
+        res.status(500).send({ message: "Failed to load admit cards list" });
+      }
+    });
+
+    // 11. GET /admin/admit-cards/bulk-data - Full candidate data and config for bulk A4 PDF generation
+    app.get('/admin/admit-cards/bulk-data', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const {
+          center,
+          student_class,
+          gender,
+          branch,
+          sub_branch,
+          registration_type,
+          reg_type,
+          download_status,
+          sms_status,
+          search,
+          limit = 100,
+        } = req.query;
+
+        const settings = await settingsCollection.findOne({}) || {};
+        const allocations = settings.exam_center_allocations || {};
+        const admitConfig = settings.admit_card_config || {};
+
+        const filter = {
+          reg_status: "accepted",
+          exam_roll: { $exists: true, $nin: [null, ""] },
+        };
+
+        if (center && center !== "all") filter.exam_center = center;
+        if (student_class && student_class !== "all") filter.student_class = student_class;
+        if (gender && gender !== "all") filter.gender = gender;
+        if (branch && branch !== "all") filter.branch = branch;
+        if (sub_branch && sub_branch !== "all") filter.sub_branch = sub_branch;
+        const selectedRegType = registration_type || reg_type;
+        if (selectedRegType === "offline") {
+          filter.registration_type = "offline";
+        } else if (selectedRegType === "online") {
+          filter.registration_type = { $ne: "offline" };
+        }
+
+        if (download_status === "downloaded") {
+          filter.$or = [{ admit_downloaded: true }, { "admit_card.downloaded": true }];
+        } else if (download_status === "pending") {
+          filter.admit_downloaded = { $ne: true };
+          filter["admit_card.downloaded"] = { $ne: true };
+        }
+
+        if (sms_status === "sent") {
+          filter["admit_sms.sent"] = true;
+        } else if (sms_status === "pending") {
+          filter["admit_sms.sent"] = { $ne: true };
+        }
+
+        if (search && search.trim()) {
+          const q = search.trim();
+          const searchConditions = [
+            { name_en: { $regex: q, $options: "i" } },
+            { name_bn: { $regex: q, $options: "i" } },
+            { exam_roll: { $regex: q, $options: "i" } },
+            { phone_number: { $regex: q, $options: "i" } },
+            { school_name: { $regex: q, $options: "i" } },
+            { form_number: { $regex: q, $options: "i" } },
+          ];
+          if (filter.$or) {
+            filter.$and = [{ $or: filter.$or }, { $or: searchConditions }];
+            delete filter.$or;
+          } else {
+            filter.$or = searchConditions;
+          }
+        }
+
+        const candidates = await applicationCollection
+          .find(filter)
+          .sort({ exam_roll: 1 })
+          .limit(parseInt(limit, 10))
+          .toArray();
+
+        const enrichedCandidates = candidates.map((cand) => ({
+          _id: cand._id,
+          name_en: cand.name_en || "",
+          name_bn: cand.name_bn || "",
+          father_name: cand.father_name || "",
+          mother_name: cand.mother_name || "",
+          gender: (cand.gender || "male").toLowerCase(),
+          student_class: cand.student_class || "",
+          student_section: cand.student_section || "",
+          student_roll: cand.student_roll || "",
+          school_name: cand.school_name || "",
+          phone_number: cand.phone_number || "",
+          whatsapp_number: cand.whatsapp_number || "",
+          present_area: cand.present_area || "",
+          present_thana: cand.present_thana || "",
+          present_zilla: cand.present_zilla || "",
+          form_number: cand.form_number || cand.paper_serial_no || cand.offline_serial || "",
+          exam_center: cand.exam_center || "",
+          exam_roll: cand.exam_roll || "",
+          office_note: cand.office_note || cand.note || "",
+          allocated_venue: resolveCandidateVenue(cand, allocations),
+        }));
+
+        res.send({
+          success: true,
+          count: enrichedCandidates.length,
+          config: admitConfig,
+          candidates: enrichedCandidates,
+        });
+      } catch (err) {
+        console.error("Admit cards bulk data error:", err);
+        res.status(500).send({ message: "Failed to load bulk admit cards data" });
+      }
+    });
+
+    // 12. PATCH /admin/admit-cards/mark-downloaded - Record download status
+    app.patch('/admin/admit-cards/mark-downloaded', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { candidateIds } = req.body || {};
+        if (!Array.isArray(candidateIds) || candidateIds.length === 0) {
+          return res.status(400).send({ message: "No candidate IDs provided" });
+        }
+
+        const validIds = candidateIds
+          .filter((id) => ObjectId.isValid(id))
+          .map((id) => new ObjectId(id));
+
+        if (validIds.length === 0) {
+          return res.status(400).send({ message: "Invalid candidate IDs" });
+        }
+
+        const result = await applicationCollection.updateMany(
+          { _id: { $in: validIds } },
+          {
+            $set: {
+              admit_downloaded: true,
+              "admit_card.downloaded": true,
+              "admit_card.downloadedAt": new Date().toISOString(),
+              "admit_card.downloadedBy": req.decoded?.email || "Admin",
+            },
+          }
+        );
+
+        res.send({
+          success: true,
+          modifiedCount: result.modifiedCount,
+          message: `${result.modifiedCount} জন প্রার্থীর প্রবেশপত্র ডাউনলোড চিহ্নিত করা হয়েছে।`,
+        });
+      } catch (err) {
+        console.error("Mark downloaded error:", err);
+        res.status(500).send({ message: "Failed to mark download status" });
+      }
+    });
+
+    // 13. POST /admin/admit-card/send-bulk-sms - Send SMS to students with generated rolls (Anti-Duplicate Guarded)
+    app.post('/admin/admit-card/send-bulk-sms', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const {
+          target = "unsent", // "unsent" | "all" | "selected"
+          candidate_ids,
+          center,
+          student_class,
+          gender,
+          custom_template
+        } = req.body || {};
+
+        const settings = await settingsCollection.findOne({}) || {};
+        const admitConfig = settings.admit_card_config || {};
+        const template = custom_template || admitConfig.sms_template || "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26";
+
+        const filter = {
+          reg_status: "accepted",
+          exam_roll: { $exists: true, $nin: [null, ""] },
+        };
+
+        if (target === "unsent") {
+          filter["admit_sms.sent"] = { $ne: true };
+        }
+
+        if (target === "selected" && Array.isArray(candidate_ids) && candidate_ids.length > 0) {
+          filter._id = { $in: candidate_ids.map(id => new ObjectId(id)) };
+        } else {
+          if (center && center !== "all") filter.exam_center = center;
+          if (student_class && student_class !== "all") filter.student_class = student_class;
+          if (gender && gender !== "all") filter.gender = gender;
+        }
+
+        const candidates = await applicationCollection.find(filter).toArray();
+
+        if (!candidates.length) {
+          return res.send({
+            success: true,
+            message: "কোনো এসএমএস পাঠানোর বাকি শিক্ষার্থী পাওয়া যায়নি (No candidates pending SMS).",
+            sentCount: 0,
+            failedCount: 0,
+            skippedCount: 0,
+            totalTargeted: 0,
+          });
+        }
+
+        let sentCount = 0;
+        let failedCount = 0;
+        let skippedCount = 0;
+
+        // Process in batches of 20 concurrent requests with delay
+        const BATCH_SIZE = 20;
+        for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+          const batch = candidates.slice(i, i + BATCH_SIZE);
+          await Promise.allSettled(batch.map(async (cand) => {
+            const rawPhone = String(cand.phone_number || "").trim();
+            const cleanPhone = rawPhone.replace(/[^0-9]/g, "");
+            const normalizedPhone = cleanPhone.startsWith("880") ? cleanPhone.slice(2) : cleanPhone;
+
+            if (!/^01[3-9]\d{8}$/.test(normalizedPhone)) {
+              skippedCount++;
+              return;
+            }
+
+            const formattedMsg = formatSmsMessage(template, cand);
+
+            try {
+              await sendBulkSMS([normalizedPhone], formattedMsg);
+              await applicationCollection.updateOne(
+                { _id: cand._id },
+                {
+                  $set: {
+                    "admit_sms.sent": true,
+                    "admit_sms.sentAt": new Date().toISOString(),
+                    "admit_sms.lastSentBy": req.decoded?.email || "Admin",
+                    "admit_sms.phone": normalizedPhone,
+                    "admit_sms.lastMessage": formattedMsg,
+                  },
+                  $inc: { "admit_sms.sentCount": 1 }
+                }
+              );
+              sentCount++;
+            } catch (smsErr) {
+              console.error(`SMS send error for candidate ${cand._id}:`, smsErr.message);
+              failedCount++;
+            }
+          }));
+
+          if (i + BATCH_SIZE < candidates.length) {
+            await new Promise((r) => setTimeout(r, 250));
+          }
+        }
+
+        res.send({
+          success: true,
+          message: `${sentCount} জন প্রার্থীর কাছে সফলভাবে এসএমএস পাঠানো হয়েছে। (ব্যর্থ: ${failedCount}, বাদ: ${skippedCount})`,
+          sentCount,
+          failedCount,
+          skippedCount,
+          totalTargeted: candidates.length,
+        });
+      } catch (err) {
+        console.error("Bulk SMS error:", err);
+        res.status(500).send({ message: "Failed to send bulk SMS: " + (err.message || "Unknown error") });
+      }
+    });
+
+    // 14. POST /admin/admit-card/resend-single-sms - Resend SMS to a single candidate
+    app.post('/admin/admit-card/resend-single-sms', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { candidateId } = req.body || {};
+        if (!candidateId || !ObjectId.isValid(candidateId)) {
+          return res.status(400).send({ message: "Invalid candidate ID" });
+        }
+
+        const cand = await applicationCollection.findOne({ _id: new ObjectId(candidateId) });
+        if (!cand) {
+          return res.status(404).send({ message: "প্রার্থী পাওয়া যায়নি।" });
+        }
+        if (!cand.exam_roll) {
+          return res.status(400).send({ message: "এই প্রার্থীর এখনো কোনো রোল নম্বর নেই।" });
+        }
+
+        const rawPhone = String(cand.phone_number || "").trim();
+        const cleanPhone = rawPhone.replace(/[^0-9]/g, "");
+        const normalizedPhone = cleanPhone.startsWith("880") ? cleanPhone.slice(2) : cleanPhone;
+
+        if (!/^01[3-9]\d{8}$/.test(normalizedPhone)) {
+          return res.status(400).send({ message: "প্রার্থীর ফোন নম্বরটি সঠিক নয় (" + rawPhone + ")" });
+        }
+
+        const settings = await settingsCollection.findOne({}) || {};
+        const admitConfig = settings.admit_card_config || {};
+        const template = admitConfig.sms_template || "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26";
+
+        const formattedMsg = formatSmsMessage(template, cand);
+        await sendBulkSMS([normalizedPhone], formattedMsg);
+
+        await applicationCollection.updateOne(
+          { _id: cand._id },
+          {
+            $set: {
+              "admit_sms.sent": true,
+              "admit_sms.sentAt": new Date().toISOString(),
+              "admit_sms.lastSentBy": req.decoded?.email || "Admin",
+              "admit_sms.phone": normalizedPhone,
+              "admit_sms.lastMessage": formattedMsg,
+            },
+            $inc: { "admit_sms.sentCount": 1 }
+          }
+        );
+
+        res.send({
+          success: true,
+          message: `${normalizedPhone} নম্বরে সফলভাবে এসএমএস পাঠানো হয়েছে।`,
+          phone: normalizedPhone,
+          messagePreview: formattedMsg,
+        });
+      } catch (err) {
+        console.error("Single SMS resend error:", err);
+        res.status(500).send({ message: "Failed to resend SMS: " + (err.message || "Unknown error") });
+      }
+    });
+
+    // -------------------------------------------------------------
+    // PUBLIC CANDIDATE ADMIT CARD DOWNLOAD PORTAL ENDPOINTS
+    // -------------------------------------------------------------
+
+    // GET /public/admit-card/status - Check publication status and countdown schedule
+    app.get('/public/admit-card/status', async (req, res) => {
+      try {
+        const settings = await settingsCollection.findOne({}) || {};
+        const config = settings.admit_card_config || {};
+        const isPublished = isAdmitCardCurrentlyPublished(config);
+
+        res.send({
+          success: true,
+          is_published: isPublished,
+          publish_status: config.admit_card_publish_status || (config.admit_card_published === false ? "draft" : "published"),
+          publish_date_time: config.publish_date_time || null,
+          publish_notice: config.publish_notice || "",
+          server_time: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error("Admit card status fetch error:", err);
+        res.status(500).send({ success: false, message: "স্ট্যাটাস লোড করা যায়নি।" });
+      }
+    });
+
+    // Admit Card Rate Limiter - 15 minutes, maximum 10 tries per IP to prevent brute-force
+    const admitCardLimiter = rateLimit({
+      windowMs: 15 * 60 * 1000,
+      limit: 10,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: {
+        success: false,
+        message: "অতিরিক্ত চেষ্টা করা হয়েছে। অনুগ্রহ করে ১৫ মিনিট পর আবার চেষ্টা করুন।"
+      }
+    });
+
+    // POST /public/admit-card/verify-phone - Step 1: Verify phone number
+    app.post('/public/admit-card/verify-phone', admitCardLimiter, async (req, res) => {
+      try {
+        // Enforce publish status for non-admin requests
+        const isAdmin = await checkIsAdminRequest(req);
+        if (!isAdmin) {
+          const settings = await settingsCollection.findOne({}) || {};
+          const config = settings.admit_card_config || {};
+          const isPublished = isAdmitCardCurrentlyPublished(config);
+          if (!isPublished) {
+            return res.status(403).send({
+              success: false,
+              is_not_published: true,
+              publish_status: config.admit_card_publish_status || "draft",
+              publish_date_time: config.publish_date_time || null,
+              message: config.publish_notice || "প্রবেশপত্র এখনো প্রকাশ করা হয়নি। নির্ধারিত সময়ে প্রকাশ করা হবে।",
+            });
+          }
+        }
+
+        const { phone } = req.body || {};
+        const raw = String(phone || "").trim();
+        const clean = raw.replace(/[^0-9]/g, "");
+        const normalized = clean.startsWith("880") ? clean.slice(2) : clean;
+
+        if (!/^01[3-9]\d{8}$/.test(normalized)) {
+          return res.status(400).send({
+            success: false,
+            message: "সঠিক ১১ ডিজিটের মোবাইল নম্বর প্রদান করুন (যেমন: 018XXXXXXXX)",
+          });
+        }
+
+        const apps = await applicationCollection.find({
+          $or: [
+            { phone_number: normalized },
+            { phone_number: `+88${normalized}` },
+            { phone_number: `88${normalized}` },
+            { phone_number: { $regex: new RegExp(`${normalized}$`) } },
+          ]
+        }).toArray();
+
+        if (!apps.length) {
+          return res.status(404).send({
+            success: false,
+            message: "এই মোবাইল নম্বরে কোনো রেজিস্ট্রেশন খুঁজে পাওয়া যায়নি। অনুগ্রহ করে আবেদনে ব্যবহৃত মোবাইল নম্বরটি দিন।",
+          });
+        }
+
+        const acceptedWithRoll = apps.filter(a => a.reg_status === "accepted" && a.exam_roll);
+        if (!acceptedWithRoll.length) {
+          const underReview = apps.some(a => a.reg_status === "under_review" || !a.reg_status);
+          if (underReview) {
+            return res.status(400).send({
+              success: false,
+              message: "আপনার আবেদনটি বর্তমানে যাচাই ও পর্যালোচনায় আছে। অনুমোদন সম্পন্ন হলে রোল নম্বর প্রদান করা হবে।",
+            });
+          }
+          const acceptedNoRoll = apps.some(a => a.reg_status === "accepted" && !a.exam_roll);
+          if (acceptedNoRoll) {
+            return res.status(400).send({
+              success: false,
+              message: "আপনার আবেদনটি অনুমোদিত হয়েছে! কিন্তু রোল নম্বর এখনো প্রস্তুত হচ্ছে। খুব শীঘ্রই এসএমএসে জানিয়ে দেওয়া হবে।",
+            });
+          }
+          return res.status(400).send({
+            success: false,
+            message: "আপনার আবেদনটি গৃহীত হয়নি। তথ্যের জন্য হেল্পলাইনে যোগাযোগ করুন।",
+          });
+        }
+
+        const candidates = acceptedWithRoll.map((cand) => {
+          const rollStr = String(cand.exam_roll || "");
+          const masked = rollStr.length >= 4 
+            ? rollStr.slice(0, 2) + "••••" + rollStr.slice(-2)
+            : "••••••••";
+          return {
+            id: cand._id,
+            name_en: cand.name_en || "",
+            name_bn: cand.name_bn || "",
+            student_class: cand.student_class || "",
+            school_name: cand.school_name || "",
+            masked_roll: masked,
+          };
+        });
+
+        res.send({
+          success: true,
+          phone: normalized,
+          candidates,
+          message: `${candidates.length} জন প্রার্থীর তথ্য পাওয়া গেছে। প্রবেশপত্র দেখতে এসএমএসে পাওয়া ৮ ডিজিটের রোল নম্বর দিন।`,
+        });
+      } catch (err) {
+        console.error("Public verify phone error:", err);
+        res.status(500).send({ success: false, message: "সার্ভারে সমস্যা হয়েছে, কিছুক্ষণ পর চেষ্টা করুন।" });
+      }
+    });
+
+    // POST /public/admit-card/login - Step 2: Login with Phone & 8-Digit Roll
+    app.post('/public/admit-card/login', admitCardLimiter, async (req, res) => {
+      try {
+        // Enforce publish status for non-admin requests
+        const isAdmin = await checkIsAdminRequest(req);
+        if (!isAdmin) {
+          const settings = await settingsCollection.findOne({}) || {};
+          const config = settings.admit_card_config || {};
+          const isPublished = isAdmitCardCurrentlyPublished(config);
+          if (!isPublished) {
+            return res.status(403).send({
+              success: false,
+              is_not_published: true,
+              publish_status: config.admit_card_publish_status || "draft",
+              publish_date_time: config.publish_date_time || null,
+              message: config.publish_notice || "প্রবেশপত্র এখনো প্রকাশ করা হয়নি। নির্ধারিত সময়ে প্রকাশ করা হবে।",
+            });
+          }
+        }
+
+        const { phone, exam_roll, candidate_id } = req.body || {};
+        const rawPhone = String(phone || "").trim();
+        const cleanPhone = rawPhone.replace(/[^0-9]/g, "");
+        const normalizedPhone = cleanPhone.startsWith("880") ? cleanPhone.slice(2) : cleanPhone;
+        const rollInput = String(exam_roll || "").trim();
+
+        if (!rollInput || rollInput.length !== 8) {
+          return res.status(400).send({
+            success: false,
+            message: "অনুগ্রহ করে এসএমএসে পাঠানো ৮ ডিজিটের রোল নম্বর সঠিকভাবে লিখুন।",
+          });
+        }
+
+        const filter = {
+          exam_roll: rollInput,
+          reg_status: "accepted",
+        };
+
+        if (candidate_id && ObjectId.isValid(candidate_id)) {
+          filter._id = new ObjectId(candidate_id);
+        } else if (normalizedPhone) {
+          filter.$or = [
+            { phone_number: normalizedPhone },
+            { phone_number: `+88${normalizedPhone}` },
+            { phone_number: `88${normalizedPhone}` },
+            { phone_number: { $regex: new RegExp(`${normalizedPhone}$`) } },
+          ];
+        }
+
+        const cand = await applicationCollection.findOne(filter);
+        if (!cand) {
+          return res.status(401).send({
+            success: false,
+            message: "মোবাইল নম্বর ও ৮ ডিজিটের রোল নম্বরের মিল পাওয়া যায়নি। অনুগ্রহ করে সঠিক রোল নম্বর দিন।",
+          });
+        }
+
+        const settings = await settingsCollection.findOne({}) || {};
+        const allocations = settings.exam_center_allocations || {};
+        const admitConfig = settings.admit_card_config || {};
+
+        const venue = resolveCandidateVenue(cand, allocations);
+
+        const enrichedCandidate = {
+          _id: cand._id,
+          name_en: cand.name_en || "",
+          name_bn: cand.name_bn || "",
+          father_name: cand.father_name || "",
+          mother_name: cand.mother_name || "",
+          gender: (cand.gender || "male").toLowerCase(),
+          student_class: cand.student_class || "",
+          student_section: cand.student_section || "",
+          student_roll: cand.student_roll || "",
+          school_name: cand.school_name || "",
+          phone_number: cand.phone_number || "",
+          whatsapp_number: cand.whatsapp_number || "",
+          present_area: cand.present_area || "",
+          present_thana: cand.present_thana || "",
+          present_zilla: cand.present_zilla || "",
+          form_number: cand.form_number || cand.paper_serial_no || cand.offline_serial || "",
+          exam_center: cand.exam_center || "",
+          exam_roll: cand.exam_roll || "",
+          office_note: cand.office_note || cand.note || "",
+          allocated_venue: venue,
+        };
+
+        res.send({
+          success: true,
+          candidate: enrichedCandidate,
+          config: admitConfig,
+          admitConfig: admitConfig,
+          venue: venue,
+          message: "লগইন সফল হয়েছে!",
+        });
+      } catch (err) {
+        console.error("Public admit card login error:", err);
+        res.status(500).send({ success: false, message: "লগইন করতে ব্যর্থ হয়েছে।" });
+      }
+    });
+
+    // POST /public/admit-card/mark-downloaded - Step 3: Record download
+    app.post('/public/admit-card/mark-downloaded', async (req, res) => {
+      try {
+        const { id, exam_roll } = req.body || {};
+        const filter = {};
+        if (id && ObjectId.isValid(id)) {
+          filter._id = new ObjectId(id);
+        } else if (exam_roll) {
+          filter.exam_roll = String(exam_roll).trim();
+        } else {
+          return res.status(400).send({ message: "Candidate ID or roll required" });
+        }
+
+        await applicationCollection.updateOne(filter, {
+          $set: {
+            admit_downloaded: true,
+            "admit_card.downloaded": true,
+            "admit_card.downloadedAt": new Date().toISOString(),
+            "admit_card.downloadedBy": "CandidatePortal",
+          }
+        });
+
+        res.send({ success: true });
+      } catch (err) {
+        console.error("Public mark downloaded error:", err);
+        res.status(500).send({ message: "Failed to mark downloaded" });
       }
     });
 
