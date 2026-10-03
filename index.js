@@ -594,14 +594,31 @@ async function run() {
 
     // sms 
     const sendBulkSMS = async (numbersArray, message) => {
-      if (!process.env.BULKSMS_API_KEY || !process.env.BULKSMS_SENDERID) {
+      let apiKey = (process.env.BULKSMS_API_KEY || "").trim();
+      if (!apiKey || apiKey === "BEf1yXuywbX8XkY7rKjt") {
+        try {
+          const fs = require('fs');
+          const path = require('path');
+          const envPath = path.join(__dirname, '.env');
+          if (fs.existsSync(envPath)) {
+            const envContent = fs.readFileSync(envPath, 'utf8');
+            const match = envContent.match(/BULKSMS_API_KEY\s*=\s*([^\r\n]+)/);
+            if (match && match[1]) {
+              apiKey = match[1].trim();
+              process.env.BULKSMS_API_KEY = apiKey;
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!apiKey || !process.env.BULKSMS_SENDERID) {
         console.warn("⚠️ BulkSMS configuration is missing. Please set BULKSMS_API_KEY and BULKSMS_SENDERID in your .env file.");
         return { response_code: 1003, success_message: "", error_message: "BulkSMS environment variables not configured." };
       }
 
       const smsData = {
-        api_key: process.env.BULKSMS_API_KEY,          // replace with your actual API key
-        senderid: process.env.BULKSMS_SENDERID,       // replace with your approved sender ID
+        api_key: apiKey,          // replace with your actual API key
+        senderid: process.env.BULKSMS_SENDERID.trim(),       // replace with your approved sender ID
         number: numbersArray.join(","),   // example: ['88016xxxxxxx','88019xxxxxxx']
         message: message,
       };
@@ -2870,6 +2887,103 @@ async function run() {
       } catch (err) {
         console.error("Single SMS resend error:", err);
         res.status(500).send({ message: "Failed to resend SMS: " + (err.message || "Unknown error") });
+      }
+    });
+
+    // In-memory cache for SMS balance (valid for 2 minutes to prevent rate limiting)
+    let smsBalanceCache = {
+      balance: null,
+      timestamp: 0,
+    };
+
+    // GET /admin/sms-balance - Fetch SMS Gateway credit/balance (Admin only)
+    app.get('/admin/sms-balance', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const force = req.query.force === "true";
+        let apiKey = (process.env.BULKSMS_API_KEY || "").trim();
+
+        // If apiKey is empty or old cached placeholder, attempt dynamic read from .env without restarting process
+        if (!apiKey || apiKey === "BEf1yXuywbX8XkY7rKjt") {
+          try {
+            const fs = require('fs');
+            const path = require('path');
+            const envPath = path.join(__dirname, '.env');
+            if (fs.existsSync(envPath)) {
+              const envContent = fs.readFileSync(envPath, 'utf8');
+              const match = envContent.match(/BULKSMS_API_KEY\s*=\s*([^\r\n]+)/);
+              if (match && match[1]) {
+                apiKey = match[1].trim();
+                process.env.BULKSMS_API_KEY = apiKey;
+              }
+            }
+          } catch (readErr) {
+            // Ignore filesystem errors and use process.env
+          }
+        }
+
+        if (!apiKey) {
+          return res.send({
+            success: false,
+            balance: null,
+            message: "BULKSMS_API_KEY is not configured",
+          });
+        }
+
+        const now = Date.now();
+        if (!force && smsBalanceCache.balance !== null && (now - smsBalanceCache.timestamp < 120000)) {
+          return res.send({
+            success: true,
+            balance: smsBalanceCache.balance,
+            cached: true,
+          });
+        }
+
+        try {
+          const response = await axios.get("http://bulksmsbd.net/api/getBalanceApi", {
+            params: { api_key: apiKey },
+            timeout: 6000,
+          });
+
+          let balance = null;
+          if (response.data) {
+            if (response.data.balance !== undefined && response.data.balance !== null) {
+              balance = parseFloat(response.data.balance);
+            } else if (response.data.Balance !== undefined && response.data.Balance !== null) {
+              balance = parseFloat(response.data.Balance);
+            } else if (typeof response.data === "string" && !isNaN(parseFloat(response.data))) {
+              balance = parseFloat(response.data);
+            }
+          }
+
+          if (balance !== null && !isNaN(balance)) {
+            smsBalanceCache = {
+              balance: balance,
+              timestamp: now,
+            };
+            return res.send({
+              success: true,
+              balance: balance,
+              cached: false,
+            });
+          }
+
+          return res.send({
+            success: false,
+            balance: smsBalanceCache.balance,
+            message: response.data?.error_message || "Unable to retrieve balance from gateway",
+            raw: response.data,
+          });
+        } catch (apiErr) {
+          console.warn("BulkSMS balance check error:", apiErr.response?.data || apiErr.message);
+          return res.send({
+            success: false,
+            balance: smsBalanceCache.balance,
+            message: apiErr.message || "Failed to contact SMS gateway",
+          });
+        }
+      } catch (err) {
+        console.error("SMS balance endpoint error:", err);
+        res.status(500).send({ success: false, message: "Internal server error" });
       }
     });
 
