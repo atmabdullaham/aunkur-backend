@@ -1182,6 +1182,10 @@ async function run() {
         const nextSerial = await getNextOfflineSerial(examCenter);
         const formNumber = `OFF-26-${nextSerial}`;
 
+        if (typeof body.school_name === "string") {
+          body.school_name = body.school_name.replace(/\s*\([\u0980-\u09FF\s&.,'/-]+\)\s*$/, '').trim();
+        }
+
         const offlineApplication = {
           ...body,
           registration_type: "offline",
@@ -1472,6 +1476,10 @@ async function run() {
           if (req.body[field] !== undefined) {
             updates[field] = req.body[field];
           }
+        }
+
+        if (typeof updates.school_name === "string") {
+          updates.school_name = updates.school_name.replace(/\s*\([\u0980-\u09FF\s&.,'/-]+\)\s*$/, '').trim();
         }
 
         updates.last_edited_by = {
@@ -2307,18 +2315,20 @@ async function run() {
         const DEFAULT_ADMIT_CONFIG = {
           exam_title: "অংকুর মেধা বৃত্তি পরীক্ষা ২০২৬",
           exam_subtitle: "Aunkur Scholarship Examination 2026",
-          exam_date: "ডিসেম্বর ২০২৬",
-          exam_date_en: "December 2026",
+          exam_date: "২৩ অক্টোবর, ২০২৬",
+          exam_date_en: "23 October, 2026",
           exam_time: "সকাল ১০:০০ টা – দুপুর ১২:৩০ টা",
           exam_time_en: "10:00 AM – 12:30 PM",
           reporting_time: "সকাল ৯:৩০ টা",
           reporting_time_en: "9:30 AM",
           instructions: [
-            "পরীক্ষার্থীকে পরীক্ষা শুরুর অন্তত ৩০ মিনিট পূর্বে নিজ আসনে উপস্থিত হতে হবে।",
-            "মূল প্রবেশপত্র (Admit Card) ব্যতীত কোনো পরীক্ষার্থীকে পরীক্ষা কক্ষে প্রবেশ করতে দেওয়া হবে না।",
-            "পরীক্ষার হলে যেকোনো ধরণের মোবাইল ফোন, স্মার্টওয়াচ বা ইলেকট্রনিক ডিভাইস আনা সম্পূর্ণ নিষিদ্ধ।",
+            "পরীক্ষার নিয়ন্ত্রকের পূর্ব ঘোষিত সময়সূচী অনুযায়ী নির্দিষ্ট তারিখ ও সময়ে পরীক্ষা অনুষ্ঠিত হবে।",
+            "পরীক্ষা শুরু হওয়ার ১৫ মিনিট আগে একটি সতর্কতামূলক ঘণ্টা বাজানো হবে এবং সঙ্গে সঙ্গে পরীক্ষার্থীর বন্ধু ও আত্মীয় স্বজন পরীক্ষার হলের প্রাঙ্গণ ছেড়ে যাবেন।",
+            "পরীক্ষার্থীর সাথে কেবলমাত্র প্রবেশপত্র ছাড়া অন্য কোন নোট, কাগজ, বইপত্র ও মোবাইল ফোন ইত্যাদি রাখা যাবে না।",
             "উত্তরপত্রে প্রার্থীর নাম, রোল নম্বর ও প্রয়োজনীয় তথ্য সতর্কতার সাথে বলপেন দ্বারা পূরণ করতে হবে।",
-            "পরীক্ষা কক্ষ ত্যাগের পূর্বে উত্তরপত্র পরিদর্শকের নিকট জমা দিয়ে নিশ্চিত করতে হবে।"
+            "পরীক্ষা কক্ষ ত্যাগের পূর্বে উত্তরপত্র পরিদর্শকের নিকট জমা দিয়ে নিশ্চিত করতে হবে।",
+            "পরীক্ষার্থীরা তাদের নিজেদের কলম, পেন্সিল সঙ্গে আনবে এবং সাধারণ ক্যালকুলেটর ও যন্ত্রপাতির ব্যবস্থা নিজেই করবে।",
+            "পরীক্ষার্থীদের অবশ্যই নিজ নিজ শিক্ষা প্রতিষ্ঠানের  শিক্ষার্থী আইডি কার্ড গলায় ঝুলিয়ে পরীক্ষার হলে উপস্থিত হতে হবে。"
           ],
           controller_name: "পরীক্ষা নিয়ন্ত্রক",
           controller_name_en: "Exam Controller",
@@ -2327,12 +2337,12 @@ async function run() {
           controller_signature_url: "",
           contact_north: "01879-891623, 01805-210314, 01878-284427",
           slogan: "শুভ্রতার স্পর্শে লালিত স্বপ্ন বিকশিত হোক সত্যের ছোঁয়ায়",
-          helpline_number: "01879891623",
+          helpline_number: "01879-891623",
           emergency_instructions: "যেকোনো জরুরি প্রয়োজনে হটলাইন নম্বরে যোগাযোগ করুন।",
-          sms_template: "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
+          sms_template: "Dear {last_name}, your Aunkur Exam Roll is {roll}. Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
           admit_card_published: true,
-          admit_card_publish_status: "published", // "published" | "scheduled" | "draft"
-          publish_date_time: "", // e.g. "2026-10-15T10:00"
+          admit_card_publish_status: "scheduled", // "published" | "scheduled" | "draft"
+          publish_date_time: "2026-10-10T10:00", // e.g. "2026-10-15T10:00"
           publish_notice: "",
         };
 
@@ -2378,9 +2388,9 @@ async function run() {
           controller_signature_url: (config.controller_signature_url || "").trim(),
           contact_north: (config.contact_north || "").trim() || "01879-891623, 01805-210314, 01878-284427",
           slogan: (config.slogan || "").trim() || "শুভ্রতার স্পর্শে লালিত স্বপ্ন বিকশিত হোক সত্যের ছোঁয়ায়",
-          helpline_number: (config.helpline_number || "").trim(),
+          helpline_number: (config.helpline_number || "").trim() || "01879-891623",
           emergency_instructions: (config.emergency_instructions || "").trim(),
-          sms_template: (config.sms_template || "").trim() || "Dear {name}, your Aunkur Exam Roll is {roll} (Class {class}). Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
+          sms_template: (config.sms_template || "").trim() || "Dear {last_name}, your Aunkur Exam Roll is {roll}. Download Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26",
           admit_card_published: Boolean(config.admit_card_published !== false && publishStatus !== "draft"),
           admit_card_publish_status: publishStatus,
           publish_date_time: (config.publish_date_time || "").trim(),
@@ -3012,15 +3022,15 @@ async function run() {
       }
     });
 
-    // Admit Card Rate Limiter - 15 minutes, maximum 10 tries per IP to prevent brute-force
+    // Admit Card Rate Limiter - 15 minutes, generous limit (60 tries per IP) to prevent lockouts while protecting from abuse
     const admitCardLimiter = rateLimit({
       windowMs: 15 * 60 * 1000,
-      limit: 10,
+      limit: 60,
       standardHeaders: "draft-8",
       legacyHeaders: false,
       message: {
         success: false,
-        message: "অতিরিক্ত চেষ্টা করা হয়েছে। অনুগ্রহ করে ১৫ মিনিট পর আবার চেষ্টা করুন।"
+        message: "অতিরিক্ত চেষ্টা করা হয়েছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।"
       }
     });
 
