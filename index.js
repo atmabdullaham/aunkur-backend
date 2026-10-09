@@ -3211,6 +3211,8 @@ async function run() {
           present_thana: cand.present_thana || "",
           present_zilla: cand.present_zilla || "",
           form_number: cand.form_number || cand.paper_serial_no || cand.offline_serial || "",
+          registration_type: cand.registration_type || (cand.form_number ? "offline" : "online"),
+          is_offline: cand.registration_type === "offline" || Boolean(cand.form_number),
           exam_center: cand.exam_center || "",
           exam_roll: cand.exam_roll || "",
           office_note: cand.office_note || cand.note || "",
