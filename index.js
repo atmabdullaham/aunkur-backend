@@ -133,6 +133,7 @@ async function run() {
     const regionsCollection = database.collection("regions");
     const studentOfTheYearCollection = database.collection("student_of_the_year");
     const countersCollection = database.collection("counters");
+    const visitorAnalyticsCollection = database.collection("visitor_analytics");
 
     // Ensure critical database indexes for high-speed lookups (Non-blocking background execution)
     let indexesAlreadyEnsured = false;
@@ -148,6 +149,7 @@ async function run() {
         () => applicationCollection.createIndex({ form_number: 1 }, { sparse: true, background: true }),
         () => applicationCollection.createIndex({ offline_serial: 1 }, { sparse: true, background: true }),
         () => userCollection.createIndex({ email: 1 }, { unique: true, background: true }),
+        () => visitorAnalyticsCollection.createIndex({ date: 1 }, { unique: true, background: true }),
       ];
 
       for (const task of indexTasks) {
@@ -357,12 +359,30 @@ async function run() {
 
       if (admitConfig.admit_card_publish_status === "scheduled") {
         if (!admitConfig.publish_date_time) return false;
-        const target = new Date(admitConfig.publish_date_time).getTime();
+        const dtStr = String(admitConfig.publish_date_time).trim();
+        const normalized = /Z|[+-]\d{2}:?\d{2}$/.test(dtStr) ? dtStr : `${dtStr}+06:00`;
+        const target = new Date(normalized).getTime();
         if (isNaN(target)) return false;
         return Date.now() >= target;
       }
 
       return Boolean(admitConfig.admit_card_published !== false);
+    };
+
+    // Helper to check if admit card correction window is currently open
+    const isAdmitCorrectionOpen = (admitConfig) => {
+      if (!admitConfig) return false;
+      if (!isAdmitCardCurrentlyPublished(admitConfig)) return false;
+      if (admitConfig.correction_open === false) return false;
+      if (admitConfig.correction_deadline) {
+        const dtStr = String(admitConfig.correction_deadline).trim();
+        const normalized = /Z|[+-]\d{2}:?\d{2}$/.test(dtStr) ? dtStr : `${dtStr}+06:00`;
+        const target = new Date(normalized).getTime();
+        if (!isNaN(target) && Date.now() > target) {
+          return false;
+        }
+      }
+      return true;
     };
 
     // Middleware to verify coordinator or admin role
@@ -2351,6 +2371,9 @@ async function run() {
           admit_card_publish_status: "scheduled", // "published" | "scheduled" | "draft"
           publish_date_time: "2026-10-10T10:00", // e.g. "2026-10-15T10:00"
           publish_notice: "",
+          correction_open: true,
+          correction_deadline: "",
+          max_corrections: 2,
         };
 
         const config = { ...DEFAULT_ADMIT_CONFIG, ...(settings.admit_card_config || {}) };
@@ -3028,6 +3051,140 @@ async function run() {
       }
     });
 
+    // =============================================================
+    // REAL-TIME VISITOR TRAFFIC TRACKING & ANALYTICS
+    // =============================================================
+    const activeVisitorSessions = new Map(); // key: sessionId, val: { lastSeen: timestamp, path: string }
+    let todaySeenVisitorSessions = new Set();
+    let currentTrackingDay = "";
+
+    // Housekeeping: Purge inactive sessions older than 2 minutes every 60s
+    setInterval(() => {
+      const now = Date.now();
+      const cutoff = now - 2 * 60 * 1000;
+      for (const [sId, data] of activeVisitorSessions.entries()) {
+        if (data.lastSeen < cutoff) {
+          activeVisitorSessions.delete(sId);
+        }
+      }
+    }, 60 * 1000);
+
+    // POST /api/track/ping - Lightweight public heartbeat ping (Zero DB write on periodic heartbeats)
+    app.post('/api/track/ping', async (req, res) => {
+      try {
+        const { sessionId, path, isPageView = false } = req.body || {};
+        if (!sessionId || typeof sessionId !== "string" || sessionId.length < 5) {
+          return res.status(400).send({ success: false });
+        }
+
+        const now = Date.now();
+        // 1. Pure in-memory update for Real-Time Live Users (0.0001ms, 0 DB writes)
+        activeVisitorSessions.set(sessionId, {
+          lastSeen: now,
+          path: String(path || "/").slice(0, 100),
+        });
+
+        // 2. Only perform database updates on actual page loads/route changes, NOT on 45s/60s heartbeats!
+        if (isPageView) {
+          const todayStr = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dhaka" }).format(new Date());
+
+          if (currentTrackingDay !== todayStr) {
+            todaySeenVisitorSessions.clear();
+            currentTrackingDay = todayStr;
+          }
+
+          const isNewVisitorToday = !todaySeenVisitorSessions.has(sessionId);
+          if (isNewVisitorToday) {
+            todaySeenVisitorSessions.add(sessionId);
+            await visitorAnalyticsCollection.updateOne(
+              { date: todayStr },
+              {
+                $inc: { unique_visitors: 1, pageviews: 1 },
+                $setOnInsert: { createdAt: new Date() }
+              },
+              { upsert: true }
+            );
+          } else {
+            await visitorAnalyticsCollection.updateOne(
+              { date: todayStr },
+              {
+                $inc: { pageviews: 1 },
+                $setOnInsert: { createdAt: new Date() }
+              },
+              { upsert: true }
+            );
+          }
+        }
+
+        res.send({ success: true, active: activeVisitorSessions.size });
+      } catch (err) {
+        res.status(200).send({ success: false });
+      }
+    });
+
+    // GET /admin/analytics/overview - Live users, weekly and total traffic stats (Admin only)
+    app.get('/admin/analytics/overview', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const todayStr = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dhaka" }).format(new Date());
+        const liveUsers = Math.max(1, activeVisitorSessions.size);
+
+        // Fetch last 14 days of analytics records
+        const records = await visitorAnalyticsCollection
+          .find({})
+          .sort({ date: -1 })
+          .limit(14)
+          .toArray();
+
+        // All-time totals aggregated across collection
+        const totalAgg = await visitorAnalyticsCollection.aggregate([
+          {
+            $group: {
+              _id: null,
+              totalVisitors: { $sum: "$unique_visitors" },
+              totalPageviews: { $sum: "$pageviews" }
+            }
+          }
+        ]).toArray();
+
+        const allTimeVisitors = (totalAgg[0]?.totalVisitors || 0);
+        const allTimePageviews = (totalAgg[0]?.totalPageviews || 0);
+
+        const todayDoc = records.find(r => r.date === todayStr) || { unique_visitors: todaySeenVisitorSessions.size || 1, pageviews: 1 };
+
+        // Last 7 days slice
+        const last7Days = records.slice(0, 7);
+        const thisWeekVisitors = last7Days.reduce((acc, r) => acc + (r.unique_visitors || 0), 0);
+        const thisWeekPageviews = last7Days.reduce((acc, r) => acc + (r.pageviews || 0), 0);
+
+        const trend = [...last7Days].reverse().map(r => ({
+          date: r.date,
+          visitors: r.unique_visitors || 0,
+          pageviews: r.pageviews || 0
+        }));
+
+        res.send({
+          success: true,
+          liveUsers,
+          today: {
+            visitors: Math.max(todayDoc.unique_visitors || 0, todaySeenVisitorSessions.size),
+            pageviews: todayDoc.pageviews || 0,
+          },
+          thisWeek: {
+            visitors: Math.max(thisWeekVisitors, todayDoc.unique_visitors || 0),
+            pageviews: Math.max(thisWeekPageviews, todayDoc.pageviews || 0),
+          },
+          total: {
+            visitors: Math.max(allTimeVisitors, todayDoc.unique_visitors || 0),
+            pageviews: Math.max(allTimePageviews, todayDoc.pageviews || 0),
+          },
+          trend,
+        });
+      } catch (err) {
+        console.error("Analytics overview error:", err);
+        res.status(500).send({ message: "Failed to load analytics overview" });
+      }
+    });
+
     // -------------------------------------------------------------
     // PUBLIC CANDIDATE ADMIT CARD DOWNLOAD PORTAL ENDPOINTS
     // -------------------------------------------------------------
@@ -3038,6 +3195,7 @@ async function run() {
         const settings = await settingsCollection.findOne({}) || {};
         const config = settings.admit_card_config || {};
         const isPublished = isAdmitCardCurrentlyPublished(config);
+        const isCorrectionOpen = isAdmitCorrectionOpen(config);
 
         res.send({
           success: true,
@@ -3045,6 +3203,8 @@ async function run() {
           publish_status: config.admit_card_publish_status || (config.admit_card_published === false ? "draft" : "published"),
           publish_date_time: config.publish_date_time || null,
           publish_notice: config.publish_notice || "",
+          is_correction_open: isCorrectionOpen,
+          correction_deadline: config.correction_deadline || null,
           server_time: new Date().toISOString(),
         });
       } catch (err) {
@@ -3248,6 +3408,8 @@ async function run() {
           exam_roll: cand.exam_roll || "",
           office_note: cand.office_note || cand.note || "",
           allocated_venue: venue,
+          edit_request: cand.edit_request || null,
+          correction_count: cand.correction_count || 0,
         };
 
         res.send({
@@ -3256,6 +3418,8 @@ async function run() {
           config: admitConfig,
           admitConfig: admitConfig,
           venue: venue,
+          is_correction_open: isAdmitCorrectionOpen(admitConfig),
+          correction_deadline: admitConfig.correction_deadline || null,
           message: "লগইন সফল হয়েছে!",
         });
       } catch (err) {
@@ -3290,6 +3454,365 @@ async function run() {
       } catch (err) {
         console.error("Public mark downloaded error:", err);
         res.status(500).send({ message: "Failed to mark downloaded" });
+      }
+    });
+
+    // =========================================================================
+    // CANDIDATE ADMIT CARD CORRECTION REQUEST & ADMIN APPROVAL SYSTEM
+    // =========================================================================
+
+    // 1. POST /public/admit-card/correction-request (Public Student Submission)
+    app.post('/public/admit-card/correction-request', admitCardLimiter, async (req, res) => {
+      try {
+        const { phone, exam_roll, candidate_id, reason, proposed_data } = req.body || {};
+        const rawPhone = String(phone || "").trim();
+        const cleanPhone = rawPhone.replace(/[^0-9]/g, "");
+        const normalizedPhone = cleanPhone.startsWith("880") ? cleanPhone.slice(2) : cleanPhone;
+        const rollInput = String(exam_roll || "").trim();
+
+        if (!rollInput || rollInput.length !== 8) {
+          return res.status(400).send({
+            success: false,
+            message: "সঠিক ৮ ডিজিটের রোল নম্বর প্রদান করুন।",
+          });
+        }
+
+        const filter = {
+          exam_roll: rollInput,
+          reg_status: "accepted",
+        };
+
+        if (candidate_id && ObjectId.isValid(candidate_id)) {
+          filter._id = new ObjectId(candidate_id);
+        } else if (normalizedPhone) {
+          filter.$or = [
+            { phone_number: normalizedPhone },
+            { phone_number: `+88${normalizedPhone}` },
+            { phone_number: `88${normalizedPhone}` },
+            { phone_number: { $regex: new RegExp(`${normalizedPhone}$`) } },
+          ];
+        }
+
+        const settings = await settingsCollection.findOne({}) || {};
+        const config = settings.admit_card_config || {};
+        if (!isAdmitCorrectionOpen(config)) {
+          return res.status(403).send({
+            success: false,
+            message: "তথ্য সংশোধনের সময়সীমা শেষ হয়েছে অথবা এই মুহূর্তে আবেদন গ্রহণ বন্ধ রয়েছে।",
+          });
+        }
+
+        const cand = await applicationCollection.findOne(filter);
+        if (!cand) {
+          return res.status(404).send({
+            success: false,
+            message: "প্রার্থীর তথ্য পাওয়া যায়নি। অনুগ্রহ করে সঠিক রোল ও ফোন নম্বর নিশ্চিত করুন।",
+          });
+        }
+
+        const maxAllowed = typeof config.max_corrections === "number" ? config.max_corrections : 2;
+        if ((cand.correction_count || 0) >= maxAllowed) {
+          return res.status(400).send({
+            success: false,
+            message: `আপনি ইতিমধ্যে সর্বোচ্চ ${maxAllowed} বার তথ্য সংশোধনের সুযোগ ব্যবহার করেছেন। আর কোনো আবেদন গ্রহণযোগ্য নয়।`,
+          });
+        }
+
+        if (cand.edit_request?.status === "pending") {
+          return res.status(400).send({
+            success: false,
+            message: "আপনার একটি তথ্য সংশোধনের আবেদন ইতোমধ্যে পর্যালোচনায় রয়েছে (Pending)। অনুগ্রহ করে অ্যাডমিনের অনুমোদনের অপেক্ষা করুন।",
+          });
+        }
+
+        const reasonStr = String(reason || "").trim();
+        if (!reasonStr) {
+          return res.status(400).send({
+            success: false,
+            message: "সংশোধনের কারণ স্পষ্টভাবে লিখুন।",
+          });
+        }
+        if (reasonStr.length > 500) {
+          return res.status(400).send({
+            success: false,
+            message: "সংশোধনের কারণ ৫০০ অক্ষরের মধ্যে লিখুন।",
+          });
+        }
+
+        // STRICT SECURITY GUARD:
+        // Only allow: name_bn, name_en, father_name, mother_name, whatsapp_number, present_area, present_thana, present_zilla
+        // exam_roll, exam_center, student_class, phone_number are NEVER modified!
+        const p = proposed_data || {};
+        const sanitizedProposed = {
+          name_bn: typeof p.name_bn === "string" ? p.name_bn.trim() : (cand.name_bn || ""),
+          name_en: typeof p.name_en === "string" ? p.name_en.trim() : (cand.name_en || ""),
+          father_name: typeof p.father_name === "string" ? p.father_name.trim() : (cand.father_name || ""),
+          mother_name: typeof p.mother_name === "string" ? p.mother_name.trim() : (cand.mother_name || ""),
+          whatsapp_number: typeof p.whatsapp_number === "string" ? p.whatsapp_number.trim() : (cand.whatsapp_number || ""),
+          present_area: typeof p.present_area === "string" ? p.present_area.trim() : (cand.present_area || ""),
+          present_thana: typeof p.present_thana === "string" ? p.present_thana.trim() : (cand.present_thana || ""),
+          present_zilla: typeof p.present_zilla === "string" ? p.present_zilla.trim() : (cand.present_zilla || ""),
+        };
+
+        const previousData = {
+          name_bn: cand.name_bn || "",
+          name_en: cand.name_en || "",
+          father_name: cand.father_name || "",
+          mother_name: cand.mother_name || "",
+          whatsapp_number: cand.whatsapp_number || "",
+          present_area: cand.present_area || "",
+          present_thana: cand.present_thana || "",
+          present_zilla: cand.present_zilla || "",
+        };
+
+        const hasChanges = Object.keys(sanitizedProposed).some(
+          (k) => sanitizedProposed[k] !== previousData[k]
+        );
+
+        if (!hasChanges) {
+          return res.status(400).send({
+            success: false,
+            message: "কোনো তথ্যে পরিবর্তন পরিলক্ষিত হয়নি। অনুগ্রহ করে সংশোধিত তথ্য সঠিকভাবে প্রদান করুন।",
+          });
+        }
+
+        const editRequest = {
+          status: "pending",
+          source: "candidate_portal",
+          reason: reasonStr,
+          requestedAt: new Date().toISOString(),
+          phone: cand.phone_number || normalizedPhone,
+          exam_roll: rollInput,
+          proposed_data: sanitizedProposed,
+          previous_data: previousData,
+        };
+
+        await applicationCollection.updateOne(
+          { _id: cand._id },
+          { $set: { edit_request: editRequest } }
+        );
+
+        res.send({
+          success: true,
+          message: "আপনার তথ্য সংশোধনের আবেদন সফলভাবে জমা নেওয়া হয়েছে। অ্যাডমিন অনুমোদন দিলে আপনার প্রবেশপত্রে সংশোধিত তথ্য যুক্ত হবে।",
+          edit_request: editRequest,
+        });
+      } catch (err) {
+        console.error("Public correction request error:", err);
+        res.status(500).send({ success: false, message: "সার্ভারে সমস্যা হয়েছে, কিছুক্ষণ পর চেষ্টা করুন।" });
+      }
+    });
+
+    // 2. GET /admin/correction-requests - List all requests with status and pagination
+    app.get('/admin/correction-requests', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { status = "all", search = "", page = 1, limit = 20 } = req.query;
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+        const skip = (pageNum - 1) * limitNum;
+
+        const filter = { "edit_request": { $exists: true, $ne: null } };
+
+        if (status && status !== "all") {
+          filter["edit_request.status"] = status;
+        }
+
+        if (search && String(search).trim()) {
+          const s = String(search).trim();
+          filter.$or = [
+            { exam_roll: { $regex: s, $options: "i" } },
+            { phone_number: { $regex: s, $options: "i" } },
+            { name_en: { $regex: s, $options: "i" } },
+            { name_bn: { $regex: s, $options: "i" } },
+          ];
+        }
+
+        const [requests, total] = await Promise.all([
+          applicationCollection
+            .find(filter)
+            .sort({ "edit_request.requestedAt": -1, _id: -1 })
+            .skip(skip)
+            .limit(limitNum)
+            .project({
+              name_en: 1,
+              name_bn: 1,
+              father_name: 1,
+              mother_name: 1,
+              student_class: 1,
+              exam_center: 1,
+              exam_roll: 1,
+              phone_number: 1,
+              school_name: 1,
+              present_area: 1,
+              present_thana: 1,
+              present_zilla: 1,
+              edit_request: 1,
+            })
+            .toArray(),
+          applicationCollection.countDocuments(filter),
+        ]);
+
+        const [pendingCount, approvedCount, rejectedCount] = await Promise.all([
+          applicationCollection.countDocuments({ "edit_request.status": "pending" }),
+          applicationCollection.countDocuments({ "edit_request.status": "approved" }),
+          applicationCollection.countDocuments({ "edit_request.status": "rejected" }),
+        ]);
+
+        res.send({
+          success: true,
+          requests,
+          total,
+          page: pageNum,
+          limit: limitNum,
+          totalPages: Math.ceil(total / limitNum),
+          counts: {
+            all: pendingCount + approvedCount + rejectedCount,
+            pending: pendingCount,
+            approved: approvedCount,
+            rejected: rejectedCount,
+          },
+        });
+      } catch (err) {
+        console.error("Fetch correction requests error:", err);
+        res.status(500).send({ message: "Failed to load correction requests" });
+      }
+    });
+
+    // 3. GET /admin/correction-requests/badge-count - Fast badge count
+    app.get('/admin/correction-requests/badge-count', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const count = await applicationCollection.countDocuments({ "edit_request.status": "pending" });
+        res.send({ success: true, count });
+      } catch (err) {
+        res.send({ success: true, count: 0 });
+      }
+    });
+
+    // 4. PATCH /admin/correction-requests/:id/approve - Approve, apply changes, and send SMS
+    app.patch('/admin/correction-requests/:id/approve', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid application ID" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const cand = await applicationCollection.findOne(filter);
+        if (!cand) {
+          return res.status(404).send({ message: "Candidate not found" });
+        }
+
+        if (cand.edit_request?.status !== "pending") {
+          return res.status(400).send({ message: "কোনো অপেক্ষমাণ সংশোধনের আবেদন নেই।" });
+        }
+
+        const proposed = cand.edit_request.proposed_data || {};
+        const allowedKeys = [
+          "name_bn", "name_en", "father_name", "mother_name",
+          "whatsapp_number",
+          "present_area", "present_thana", "present_zilla"
+        ];
+
+        // STRICT SECURITY: Apply ONLY allowed keys. Exam center, roll, class, phone are 100% UNTOUCHABLE!
+        const updateFields = {};
+        for (const key of allowedKeys) {
+          if (proposed[key] !== undefined) {
+            updateFields[key] = proposed[key];
+          }
+        }
+
+        updateFields["edit_request.status"] = "approved";
+        updateFields["edit_request.resolvedAt"] = new Date().toISOString();
+        updateFields["edit_request.resolved_by"] = {
+          email: req.decoded?.email || null,
+          name: req.decoded?.email || "Admin",
+        };
+
+        const { sendSms = true } = req.body || {};
+        let smsSent = false;
+        let smsMessage = "";
+
+        if (sendSms && cand.phone_number) {
+          const raw = String(cand.phone_number).trim().replace(/[^0-9]/g, "");
+          const normalizedPhone = raw.startsWith("880") ? raw.slice(2) : raw;
+          if (/^01[3-9]\d{8}$/.test(normalizedPhone)) {
+            const lastName = formatLastName(updateFields.name_en || cand.name_en || cand.name_bn || "Candidate");
+            smsMessage = `Dear ${lastName}, your Aunkur Admit Card correction request has been approved. Please download your updated admit card: aunkurctgnorth.org/admitcard - Aunkur'26`;
+            try {
+              await sendBulkSMS([normalizedPhone], smsMessage);
+              smsSent = true;
+              updateFields["edit_request.sms_sent"] = true;
+              updateFields["edit_request.sms_sent_at"] = new Date().toISOString();
+              updateFields["edit_request.sms_message"] = smsMessage;
+            } catch (smsErr) {
+              console.warn("Correction confirmation SMS failed:", smsErr.message);
+              updateFields["edit_request.sms_sent"] = false;
+              updateFields["edit_request.sms_error"] = smsErr.message;
+            }
+          }
+        }
+
+        await applicationCollection.updateOne(filter, {
+          $set: updateFields,
+          $inc: { correction_count: 1 },
+        });
+        const updatedCand = await applicationCollection.findOne(filter);
+
+        res.send({
+          success: true,
+          message: smsSent
+            ? "সংশোধন অনুমোদন করা হয়েছে এবং শিক্ষার্থীকে নিশ্চিতকরণ এসএমএস পাঠানো হয়েছে।"
+            : "সংশোধন সফলভাবে অনুমোদন করা হয়েছে।",
+          smsSent,
+          data: updatedCand,
+        });
+      } catch (err) {
+        console.error("Approve correction request error:", err);
+        res.status(500).send({ message: "Failed to approve correction request" });
+      }
+    });
+
+    // 5. PATCH /admin/correction-requests/:id/reject - Reject with admin note
+    app.patch('/admin/correction-requests/:id/reject', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid application ID" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const cand = await applicationCollection.findOne(filter);
+        if (!cand) {
+          return res.status(404).send({ message: "Candidate not found" });
+        }
+
+        if (cand.edit_request?.status !== "pending") {
+          return res.status(400).send({ message: "কোনো অপেক্ষমাণ সংশোধনের আবেদন নেই।" });
+        }
+
+        const adminNote = String(req.body?.admin_note || "আবেদনটি গ্রহণযোগ্য নয়").trim();
+
+        await applicationCollection.updateOne(filter, {
+          $set: {
+            "edit_request.status": "rejected",
+            "edit_request.admin_note": adminNote,
+            "edit_request.resolvedAt": new Date().toISOString(),
+            "edit_request.resolved_by": {
+              email: req.decoded?.email || null,
+              name: req.decoded?.email || "Admin",
+            },
+          },
+        });
+
+        const updatedCand = await applicationCollection.findOne(filter);
+        res.send({
+          success: true,
+          message: "সংশোধনের আবেদনটি বাতিল করা হয়েছে।",
+          data: updatedCand,
+        });
+      } catch (err) {
+        console.error("Reject correction request error:", err);
+        res.status(500).send({ message: "Failed to reject correction request" });
       }
     });
 
