@@ -613,7 +613,7 @@ async function run() {
 
       if (!apiKey || !process.env.BULKSMS_SENDERID) {
         console.warn("⚠️ BulkSMS configuration is missing. Please set BULKSMS_API_KEY and BULKSMS_SENDERID in your .env file.");
-        return { response_code: 1003, success_message: "", error_message: "BulkSMS environment variables not configured." };
+        throw new Error("BulkSMS environment variables (BULKSMS_API_KEY / BULKSMS_SENDERID) not configured.");
       }
 
       const smsData = {
@@ -625,8 +625,14 @@ async function run() {
 
       try {
         const response = await axios.post("http://bulksmsbd.net/api/smsapi", smsData);
-        // console.log("✅ SMS sent successfully:", response.data);
-        return response.data;
+        const resData = response.data;
+        if (resData && resData.response_code !== 202) {
+          const err = new Error(resData.error_message || `BulkSMS error code ${resData.response_code}`);
+          err.response_code = resData.response_code;
+          err.data = resData;
+          throw err;
+        }
+        return resData;
       } catch (error) {
         console.error("❌ SMS sending failed:", error.response?.data || error.message);
         throw error;
@@ -1806,6 +1812,7 @@ async function run() {
             gender: 1,
             exam_roll: 1,
             exam_roll_bucket: 1,
+            admit_sms: 1,
             admit_card: 1,
             admit_downloaded: 1,
           })
@@ -1856,7 +1863,7 @@ async function run() {
         let totalDownloadPending = 0;
 
         for (const app of acceptedApps) {
-          const { bucketKey } = resolveCandidateBucket(app);
+          const bucketKey = app.exam_roll_bucket || resolveCandidateBucket(app).bucketKey;
           const bucket = bucketMap[bucketKey];
           if (!bucket) continue;
 
@@ -2447,6 +2454,10 @@ async function run() {
           exam_roll: { $exists: true, $nin: [null, ""] },
         };
 
+        if (req.query.bucketKey) {
+          filter.exam_roll_bucket = req.query.bucketKey;
+        }
+
         if (center && center !== "all") {
           filter.exam_center = center;
         }
@@ -2613,6 +2624,7 @@ async function run() {
           exam_roll: { $exists: true, $nin: [null, ""] },
         };
 
+        if (req.query.bucketKey) filter.exam_roll_bucket = req.query.bucketKey;
         if (center && center !== "all") filter.exam_center = center;
         if (student_class && student_class !== "all") filter.student_class = student_class;
         if (gender && gender !== "all") filter.gender = gender;
@@ -2742,6 +2754,8 @@ async function run() {
         const {
           target = "unsent", // "unsent" | "all" | "selected"
           candidate_ids,
+          bucketKey,
+          bucket_key,
           center,
           student_class,
           gender,
@@ -2761,7 +2775,10 @@ async function run() {
           filter["admit_sms.sent"] = { $ne: true };
         }
 
-        if (target === "selected" && Array.isArray(candidate_ids) && candidate_ids.length > 0) {
+        const targetBucket = bucketKey || bucket_key;
+        if (targetBucket) {
+          filter.exam_roll_bucket = targetBucket;
+        } else if (target === "selected" && Array.isArray(candidate_ids) && candidate_ids.length > 0) {
           filter._id = { $in: candidate_ids.map(id => new ObjectId(id)) };
         } else {
           if (center && center !== "all") filter.exam_center = center;
@@ -2813,6 +2830,8 @@ async function run() {
                     "admit_sms.lastSentBy": req.decoded?.email || "Admin",
                     "admit_sms.phone": normalizedPhone,
                     "admit_sms.lastMessage": formattedMsg,
+                    "admit_sms.failed": false,
+                    "admit_sms.error": null,
                   },
                   $inc: { "admit_sms.sentCount": 1 }
                 }
@@ -2820,6 +2839,16 @@ async function run() {
               sentCount++;
             } catch (smsErr) {
               console.error(`SMS send error for candidate ${cand._id}:`, smsErr.message);
+              await applicationCollection.updateOne(
+                { _id: cand._id },
+                {
+                  $set: {
+                    "admit_sms.failed": true,
+                    "admit_sms.error": smsErr.message,
+                    "admit_sms.failedAt": new Date().toISOString(),
+                  }
+                }
+              );
               failedCount++;
             }
           }));
@@ -2883,6 +2912,8 @@ async function run() {
               "admit_sms.lastSentBy": req.decoded?.email || "Admin",
               "admit_sms.phone": normalizedPhone,
               "admit_sms.lastMessage": formattedMsg,
+              "admit_sms.failed": false,
+              "admit_sms.error": null,
             },
             $inc: { "admit_sms.sentCount": 1 }
           }
