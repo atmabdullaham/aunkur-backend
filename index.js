@@ -1494,7 +1494,7 @@ async function run() {
           "father_name", "father_occupation", "mother_name", "mother_occupation",
           "present_area", "present_thana", "present_zilla",
           "permanent_area", "permanent_thana", "permanent_zilla",
-          "form_number", "paper_serial_no", "note"
+          "form_number", "paper_serial_no", "note", "office_note"
         ];
 
         const updates = {};
@@ -1502,6 +1502,12 @@ async function run() {
           if (req.body[field] !== undefined) {
             updates[field] = req.body[field];
           }
+        }
+
+        if (updates.note !== undefined && updates.office_note === undefined) {
+          updates.office_note = updates.note;
+        } else if (updates.office_note !== undefined && updates.note === undefined) {
+          updates.note = updates.office_note;
         }
 
         if (typeof updates.school_name === "string") {
@@ -2569,6 +2575,7 @@ async function run() {
         const enrichedCandidates = candidates.map((cand) => {
           const venue = resolveCandidateVenue(cand, allocations);
           const isDownloaded = Boolean(cand.admit_card?.downloaded || cand.admit_downloaded);
+          const resolvedNote = cand.office_note || cand.note || cand.admin_note || "";
           return {
             _id: cand._id,
             name_en: cand.name_en || "",
@@ -2596,6 +2603,8 @@ async function run() {
             admit_downloaded_at: cand.admit_card?.downloadedAt || null,
             admit_sms: cand.admit_sms || null,
             allocated_venue: venue,
+            office_note: resolvedNote,
+            note: resolvedNote,
           };
         });
 
@@ -2697,28 +2706,32 @@ async function run() {
           .limit(parseInt(limit, 10))
           .toArray();
 
-        const enrichedCandidates = candidates.map((cand) => ({
-          _id: cand._id,
-          name_en: cand.name_en || "",
-          name_bn: cand.name_bn || "",
-          father_name: cand.father_name || "",
-          mother_name: cand.mother_name || "",
-          gender: (cand.gender || "male").toLowerCase(),
-          student_class: cand.student_class || "",
-          student_section: cand.student_section || "",
-          student_roll: cand.student_roll || "",
-          school_name: cand.school_name || "",
-          phone_number: cand.phone_number || "",
-          whatsapp_number: cand.whatsapp_number || "",
-          present_area: cand.present_area || "",
-          present_thana: cand.present_thana || "",
-          present_zilla: cand.present_zilla || "",
-          form_number: cand.form_number || cand.paper_serial_no || cand.offline_serial || "",
-          exam_center: cand.exam_center || "",
-          exam_roll: cand.exam_roll || "",
-          office_note: cand.office_note || cand.note || "",
-          allocated_venue: resolveCandidateVenue(cand, allocations),
-        }));
+        const enrichedCandidates = candidates.map((cand) => {
+          const resolvedNote = cand.office_note || cand.note || cand.admin_note || "";
+          return {
+            _id: cand._id,
+            name_en: cand.name_en || "",
+            name_bn: cand.name_bn || "",
+            father_name: cand.father_name || "",
+            mother_name: cand.mother_name || "",
+            gender: (cand.gender || "male").toLowerCase(),
+            student_class: cand.student_class || "",
+            student_section: cand.student_section || "",
+            student_roll: cand.student_roll || "",
+            school_name: cand.school_name || "",
+            phone_number: cand.phone_number || "",
+            whatsapp_number: cand.whatsapp_number || "",
+            present_area: cand.present_area || "",
+            present_thana: cand.present_thana || "",
+            present_zilla: cand.present_zilla || "",
+            form_number: cand.form_number || cand.paper_serial_no || cand.offline_serial || "",
+            exam_center: cand.exam_center || "",
+            exam_roll: cand.exam_roll || "",
+            office_note: resolvedNote,
+            note: resolvedNote,
+            allocated_venue: resolveCandidateVenue(cand, allocations),
+          };
+        });
 
         res.send({
           success: true,
@@ -2768,6 +2781,35 @@ async function run() {
       } catch (err) {
         console.error("Mark downloaded error:", err);
         res.status(500).send({ message: "Failed to mark download status" });
+      }
+    });
+
+    // 12b. PATCH /admin/admit-cards/:id/office-note - Update candidate's office note
+    app.patch('/admin/admit-cards/:id/office-note', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid candidate ID" });
+        }
+        const note = typeof req.body?.note === "string" ? req.body.note.trim() : "";
+        const result = await applicationCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              note: note,
+              office_note: note,
+              note_updated_at: new Date().toISOString(),
+              note_updated_by: {
+                email: req.decoded?.email || null,
+                name: req.user?.name || req.decoded?.email || "Admin",
+              },
+            },
+          }
+        );
+        res.send({ success: true, message: "অফিস নোট সফলভাবে আপডেট করা হয়েছে!", note });
+      } catch (err) {
+        console.error("Update office note error:", err);
+        res.status(500).send({ message: "Failed to update office note" });
       }
     });
 
@@ -3406,7 +3448,8 @@ async function run() {
           is_offline: cand.registration_type === "offline" || Boolean(cand.form_number),
           exam_center: cand.exam_center || "",
           exam_roll: cand.exam_roll || "",
-          office_note: cand.office_note || cand.note || "",
+          office_note: cand.office_note || cand.note || cand.admin_note || "",
+          note: cand.note || cand.office_note || cand.admin_note || "",
           allocated_venue: venue,
           edit_request: cand.edit_request || null,
           correction_count: cand.correction_count || 0,
