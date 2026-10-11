@@ -3583,39 +3583,79 @@ async function run() {
         }
 
         // STRICT SECURITY GUARD:
-        // Only allow: name_bn, name_en, father_name, mother_name, whatsapp_number, present_area, present_thana, present_zilla
+        // Only allow: name_bn, name_en, father_name, mother_name, school_name, whatsapp_number, present_area, present_thana, present_zilla
         // exam_roll, exam_center, student_class, phone_number are NEVER modified!
         const p = proposed_data || {};
-        const sanitizedProposed = {
-          name_bn: typeof p.name_bn === "string" ? p.name_bn.trim() : (cand.name_bn || ""),
-          name_en: typeof p.name_en === "string" ? p.name_en.trim() : (cand.name_en || ""),
-          father_name: typeof p.father_name === "string" ? p.father_name.trim() : (cand.father_name || ""),
-          mother_name: typeof p.mother_name === "string" ? p.mother_name.trim() : (cand.mother_name || ""),
-          whatsapp_number: typeof p.whatsapp_number === "string" ? p.whatsapp_number.trim() : (cand.whatsapp_number || ""),
-          present_area: typeof p.present_area === "string" ? p.present_area.trim() : (cand.present_area || ""),
-          present_thana: typeof p.present_thana === "string" ? p.present_thana.trim() : (cand.present_thana || ""),
-          present_zilla: typeof p.present_zilla === "string" ? p.present_zilla.trim() : (cand.present_zilla || ""),
+
+        const normalizeText = (val) =>
+          val === null || val === undefined ? "" : String(val).replace(/\s+/g, " ").trim();
+
+        const normalizeSchool = (val) => {
+          if (!val) return "";
+          return String(val)
+            .replace(/\s*\([\u0980-\u09FF\s&.,'/-]+\)\s*$/, "")
+            .replace(/\s+/g, " ")
+            .trim();
         };
 
-        const previousData = {
-          name_bn: cand.name_bn || "",
-          name_en: cand.name_en || "",
-          father_name: cand.father_name || "",
-          mother_name: cand.mother_name || "",
-          whatsapp_number: cand.whatsapp_number || "",
-          present_area: cand.present_area || "",
-          present_thana: cand.present_thana || "",
-          present_zilla: cand.present_zilla || "",
+        const formatEnglishName = (name) => {
+          if (!name) return "";
+          const cleaned = String(name).replace(/\s+/g, " ").trim();
+          if (/[\u0980-\u09FF]/.test(cleaned)) return cleaned;
+          return cleaned
+            .toLowerCase()
+            .replace(/(?:^|[\s\-/'])\S/g, (char) => char.toUpperCase());
         };
 
-        const hasChanges = Object.keys(sanitizedProposed).some(
-          (k) => sanitizedProposed[k] !== previousData[k]
-        );
+        const allowedKeys = [
+          "name_bn", "name_en", "father_name", "mother_name", "school_name",
+          "whatsapp_number", "present_area", "present_thana", "present_zilla"
+        ];
 
-        if (!hasChanges) {
+        const sanitizedProposed = {};
+        const previousData = {};
+
+        for (const key of allowedKeys) {
+          if (p[key] === undefined) continue;
+
+          const propRaw = p[key];
+          const origRaw = cand[key] || "";
+
+          let isDifferent = false;
+          let finalProposed = "";
+          let finalPrevious = "";
+
+          if (key === "name_en") {
+            finalProposed = formatEnglishName(propRaw);
+            finalPrevious = formatEnglishName(origRaw);
+            isDifferent = finalProposed !== finalPrevious;
+          } else if (key === "school_name") {
+            finalProposed = normalizeSchool(propRaw);
+            finalPrevious = normalizeSchool(origRaw);
+            isDifferent = finalProposed.toLowerCase() !== finalPrevious.toLowerCase();
+          } else if (key === "whatsapp_number") {
+            const numProposed = normalizeText(propRaw).replace(/[^0-9]/g, "");
+            const numPrevious = normalizeText(origRaw).replace(/[^0-9]/g, "");
+            finalProposed = normalizeText(propRaw);
+            finalPrevious = normalizeText(origRaw);
+            isDifferent = numProposed !== numPrevious;
+          } else {
+            finalProposed = normalizeText(propRaw);
+            finalPrevious = normalizeText(origRaw);
+            isDifferent = finalProposed !== finalPrevious;
+          }
+
+          // ONLY include in correction request if there is a REAL value change!
+          if (isDifferent) {
+            sanitizedProposed[key] = finalProposed;
+            previousData[key] = finalPrevious || origRaw || "";
+          }
+        }
+
+        if (Object.keys(sanitizedProposed).length === 0) {
           return res.status(400).send({
             success: false,
-            message: "কোনো তথ্যে পরিবর্তন পরিলক্ষিত হয়নি। অনুগ্রহ করে সংশোধিত তথ্য সঠিকভাবে প্রদান করুন।",
+            message: "কোনো তথ্যে প্রকৃত পরিবর্তন পরিলক্ষিত হয়নি। কোনো তথ্য পরিবর্তন না হলে আবেদন জমা দেওয়া সম্ভব নয়।",
           });
         }
 
@@ -3752,7 +3792,7 @@ async function run() {
         const proposed = cand.edit_request.proposed_data || {};
         const allowedKeys = [
           "name_bn", "name_en", "father_name", "mother_name",
-          "whatsapp_number",
+          "school_name", "whatsapp_number",
           "present_area", "present_thana", "present_zilla"
         ];
 
@@ -3762,6 +3802,12 @@ async function run() {
           if (proposed[key] !== undefined) {
             updateFields[key] = proposed[key];
           }
+        }
+
+        if (typeof updateFields.school_name === "string") {
+          updateFields.school_name = updateFields.school_name
+            .replace(/\s*\([\u0980-\u09FF\s&.,'/-]+\)\s*$/, "")
+            .trim();
         }
 
         updateFields["edit_request.status"] = "approved";
