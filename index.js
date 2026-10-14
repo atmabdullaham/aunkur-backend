@@ -3910,6 +3910,241 @@ async function run() {
       res.send(result)
     })
 
+    // Escapes user input so it can be used literally inside a $regex
+    const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    // Only the columns the admin/coordinator registration tables display.
+    // Full records are still loaded one at a time from /registration-details/:id.
+    const REGISTRATION_LIST_PROJECTION = {
+      _id: 1,
+      name_en: 1,
+      name_bn: 1,
+      student_class: 1,
+      student_section: 1,
+      student_roll: 1,
+      school_name: 1,
+      phone_number: 1,
+      whatsapp_number: 1,
+      gender: 1,
+      exam_center: 1,
+      reg_status: 1,
+      registration_type: 1,
+      transaction_Id: 1,
+      bkash_number: 1,
+      submittedAt: 1,
+      createdAt: 1,
+      paper_serial_no: 1,
+      offline_serial: 1,
+      form_number: 1,
+      reference: 1,
+      branch: 1,
+      sub_branch: 1,
+      note: 1,
+      created_by: 1,
+    };
+
+    // Admin dashboard summary — grouped counts instead of every record.
+    // Groups keep the raw field values so the dashboard applies exactly the same
+    // matching rules it always has, just weighted by count.
+    app.get('/admin/dashboard-summary', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        // Same as JS Boolean(value) for the values these fields can hold
+        const isTruthy = (field) => ({
+          $not: [{ $in: [{ $ifNull: [field, null] }, [null, "", 0, false]] }],
+        });
+        // Same rule the dashboard uses: typed offline, or carrying an offline/paper serial
+        const isOfflineExpr = {
+          $or: [
+            { $eq: ["$registration_type", "offline"] },
+            isTruthy("$offline_serial"),
+            isTruthy("$paper_serial_no"),
+          ],
+        };
+        // submittedAt || createdAt, as a Bangladesh calendar day (null when missing/invalid)
+        const rawDateExpr = { $cond: [isTruthy("$submittedAt"), "$submittedAt", "$createdAt"] };
+        const dayExpr = {
+          $dateToString: {
+            date: { $convert: { input: rawDateExpr, to: "date", onError: null, onNull: null } },
+            format: "%Y-%m-%d",
+            timezone: "Asia/Dhaka",
+          },
+        };
+
+        const [result] = await applicationCollection.aggregate([
+          {
+            $project: {
+              offline: isOfflineExpr,
+              reg_status: 1,
+              student_class: 1,
+              gender: 1,
+              exam_center: 1,
+              branch: 1,
+              reference: 1,
+              sub_branch: 1,
+              creator_email: "$created_by.email",
+              creator_name: "$created_by.name",
+              has_creator: isTruthy("$created_by.email"),
+              day: dayExpr,
+            },
+          },
+          {
+            $facet: {
+              statusCounts: [
+                { $group: { _id: { offline: "$offline", reg_status: "$reg_status" }, count: { $sum: 1 } } },
+              ],
+              // Class / center tables only use accepted registrations (case-insensitive)
+              accepted: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: [{ $type: "$reg_status" }, "string"] },
+                        { $eq: [{ $toLower: "$reg_status" }, "accepted"] },
+                      ],
+                    },
+                  },
+                },
+                {
+                  $group: {
+                    _id: {
+                      reg_status: "$reg_status",
+                      student_class: "$student_class",
+                      gender: "$gender",
+                      exam_center: "$exam_center",
+                    },
+                    count: { $sum: 1 },
+                  },
+                },
+              ],
+              daily: [
+                { $match: { day: { $ne: null } } },
+                { $group: { _id: { offline: "$offline", day: "$day" }, count: { $sum: 1 } } },
+              ],
+              offlineAreas: [
+                { $match: { offline: true } },
+                {
+                  $group: {
+                    _id: {
+                      branch: "$branch",
+                      reference: "$reference",
+                      sub_branch: "$sub_branch",
+                      reg_status: "$reg_status",
+                    },
+                    count: { $sum: 1 },
+                  },
+                },
+              ],
+              coordinators: [
+                { $match: { $or: [{ offline: true }, { has_creator: true }] } },
+                {
+                  $group: {
+                    _id: { offline: "$offline", email: "$creator_email", name: "$creator_name" },
+                    count: { $sum: 1 },
+                    firstId: { $min: "$_id" },
+                  },
+                },
+                // Earliest entry first, so names and tie order match record order
+                { $sort: { firstId: 1 } },
+              ],
+            },
+          },
+        ]).toArray();
+
+        const flatten = (rows = []) => rows.map(({ _id, count }) => ({ ..._id, count }));
+
+        res.send({
+          success: true,
+          statusCounts: flatten(result?.statusCounts),
+          accepted: flatten(result?.accepted),
+          daily: flatten(result?.daily),
+          offlineAreas: flatten(result?.offlineAreas),
+          coordinators: (result?.coordinators || []).map(({ _id, count }) => ({
+            offline: _id.offline,
+            created_by: { email: _id.email, name: _id.name },
+            count,
+          })),
+        });
+      } catch (err) {
+        console.error("Dashboard summary error:", err);
+        res.status(500).send({ message: "Failed to load dashboard summary" });
+      }
+    });
+
+    // Admin registration tables. Filters mirror the ones the pages apply client-side.
+    // With ?page=N the result is paginated; without it, every match is returned.
+    app.get('/admin/registrations/list', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { status = "all", gender, student_class, exam_center, txn, bkash, page, limit } = req.query;
+
+        const filter = {};
+        if (["under_review", "accepted", "rejected"].includes(status)) {
+          filter.reg_status = status;
+        }
+        if (typeof gender === "string" && gender) filter.gender = gender;
+        if (typeof student_class === "string" && student_class) filter.student_class = student_class;
+        if (typeof exam_center === "string" && exam_center) filter.exam_center = exam_center;
+        // Transaction ID: case-insensitive "contains"; bKash number: case-sensitive "contains"
+        if (typeof txn === "string" && txn.trim()) {
+          filter.transaction_Id = { $regex: escapeRegex(txn), $options: "i" };
+        }
+        if (typeof bkash === "string" && bkash.trim()) {
+          filter.bkash_number = { $regex: escapeRegex(bkash) };
+        }
+
+        if (page === undefined) {
+          const items = await applicationCollection
+            .find(filter)
+            .project(REGISTRATION_LIST_PROJECTION)
+            .toArray();
+          return res.send({ success: true, items, total: items.length });
+        }
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+
+        const [items, total] = await Promise.all([
+          applicationCollection
+            .find(filter)
+            .sort({ $natural: 1 }) // same order the full list has always been shown in
+            .skip((pageNum - 1) * limitNum)
+            .limit(limitNum)
+            .project(REGISTRATION_LIST_PROJECTION)
+            .toArray(),
+          applicationCollection.countDocuments(filter),
+        ]);
+
+        res.send({
+          success: true,
+          items,
+          total,
+          page: pageNum,
+          totalPages: Math.ceil(total / limitNum),
+        });
+      } catch (err) {
+        console.error("Admin registrations list error:", err);
+        res.status(500).send({ message: "Failed to load registrations" });
+      }
+    });
+
+    // Coordinator "My Entries" — only the entries created by the requester
+    app.get('/my-entries', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const email = (req.decoded?.email || "").toLowerCase().trim();
+        if (!email) {
+          return res.status(400).send({ message: "Valid email is required" });
+        }
+        // Case- and whitespace-insensitive match, same as the page's own comparison
+        const items = await applicationCollection
+          .find({ "created_by.email": { $regex: `^\\s*${escapeRegex(email)}\\s*$`, $options: "i" } })
+          .project(REGISTRATION_LIST_PROJECTION)
+          .toArray();
+        res.send({ success: true, items });
+      } catch (err) {
+        console.error("My entries error:", err);
+        res.status(500).send({ message: "Failed to load entries" });
+      }
+    });
+
     // Offline registrations page.
     // entries: full records for the table — every offline entry for admins, only their own for coordinators.
     // summary: every offline entry, stripped to the fields the summary cards need (no personal details).
