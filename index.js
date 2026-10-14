@@ -148,6 +148,19 @@ async function run() {
         () => applicationCollection.createIndex({ registration_type: 1, reg_status: 1 }, { background: true }),
         () => applicationCollection.createIndex({ form_number: 1 }, { sparse: true, background: true }),
         () => applicationCollection.createIndex({ offline_serial: 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex({ submittedAt: -1, _id: -1 }, { background: true }),
+        // Exam controller: admit card list / roll candidates / correction requests
+        () => applicationCollection.createIndex({ reg_status: 1, exam_roll: 1 }, { background: true }),
+        () => applicationCollection.createIndex({ exam_roll_bucket: 1, exam_roll: 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex({ "edit_request.status": 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex({ "edit_request.requestedAt": -1 }, { sparse: true, background: true }),
+        // Bucket change: retired roll lookup, and the duplicate-roll guard (refused by MongoDB
+        // while duplicates exist; it switches on by itself once they are resolved)
+        () => applicationCollection.createIndex({ "roll_history.old_roll": 1 }, { sparse: true, background: true }),
+        () => applicationCollection.createIndex(
+          { exam_roll: 1 },
+          { unique: true, name: "exam_roll_unique", partialFilterExpression: { exam_roll: { $type: "string", $gt: "" } } }
+        ),
         () => userCollection.createIndex({ email: 1 }, { unique: true, background: true }),
         () => visitorAnalyticsCollection.createIndex({ date: 1 }, { unique: true, background: true }),
       ];
@@ -1514,6 +1527,11 @@ async function run() {
           updates.school_name = updates.school_name.replace(/\s*\([\u0980-\u09FF\s&.,'/-]+\)\s*$/, '').trim();
         }
 
+        const bucketBlock = rollBucketChangeBlock(existing, updates);
+        if (bucketBlock) {
+          return res.status(409).send({ message: bucketBlock });
+        }
+
         updates.last_edited_by = {
           email: req.decoded?.email || null,
           name: req.user?.name || req.decoded?.email || "Admin",
@@ -1589,6 +1607,11 @@ async function run() {
           }
         }
 
+        const requestBucketBlock = rollBucketChangeBlock(application, proposed_data);
+        if (requestBucketBlock) {
+          return res.status(409).send({ message: requestBucketBlock });
+        }
+
         const editRequest = {
           status: "pending",
           reason,
@@ -1641,6 +1664,10 @@ async function run() {
         }
 
         const proposed = application.edit_request.proposed_data || {};
+        const approveBucketBlock = rollBucketChangeBlock(application, proposed);
+        if (approveBucketBlock) {
+          return res.status(409).send({ message: approveBucketBlock });
+        }
         const updateFields = { ...proposed };
 
         updateFields["edit_request.status"] = "approved";
@@ -1824,6 +1851,658 @@ async function run() {
         .replace(/{link}/g, link);
     };
 
+    // ========================================================
+    // RUN LOCKS — only one roll generation / one bulk SMS run at a time, across all
+    // admins, tabs and server instances. Stored in the settings document as
+    // run_locks.<name> = { runId, by, startedAt, heartbeatAt }. A lock whose heartbeat
+    // is older than RUN_LOCK_STALE_MS is treated as abandoned (closed tab, killed function).
+    // ========================================================
+    const RUN_LOCK_STALE_MS = 2 * 60 * 1000;
+
+    // Returns { runId } when taken, or { heldBy } describing the run that holds it
+    const acquireRunLock = async (name, by) => {
+      await getSettings(); // make sure the single settings document exists (never upsert below)
+      const field = `run_locks.${name}`;
+      const now = Date.now();
+      const runId = new ObjectId().toHexString();
+      const taken = await settingsCollection.findOneAndUpdate(
+        {
+          $or: [
+            { [field]: { $exists: false } },
+            { [field]: null },
+            { [`${field}.heartbeatAt`]: { $lt: now - RUN_LOCK_STALE_MS } },
+          ],
+        },
+        { $set: { [field]: { runId, by, startedAt: now, heartbeatAt: now } } },
+        { returnDocument: "after", projection: { [field]: 1 } }
+      );
+      if (taken) return { runId };
+      const current = await settingsCollection.findOne({}, { projection: { [field]: 1 } });
+      return { heldBy: current?.run_locks?.[name] || null };
+    };
+
+    // Keeps the lock alive; false when this run no longer holds it
+    const refreshRunLock = async (name, runId) => {
+      const field = `run_locks.${name}`;
+      const result = await settingsCollection.updateOne(
+        { [`${field}.runId`]: runId },
+        { $set: { [`${field}.heartbeatAt`]: Date.now() } }
+      );
+      return result.matchedCount > 0;
+    };
+
+    const releaseRunLock = async (name, runId) => {
+      const field = `run_locks.${name}`;
+      await settingsCollection.updateOne({ [`${field}.runId`]: runId }, { $unset: { [field]: "" } });
+    };
+
+    const formatLockHolder = (heldBy) => {
+      if (!heldBy) return "";
+      const startedAt = new Date(heldBy.startedAt).toLocaleTimeString("en-US", { timeZone: "Asia/Dhaka", hour: "numeric", minute: "2-digit" });
+      return ` (${heldBy.by || "Admin"}, শুরু: ${startedAt})`;
+    };
+
+    // ========================================================
+    // ROLL SERIALS — one counter per bucket (counters: exam_roll_serial_<bucketKey>).
+    // A roll's own digits say which bucket issued it (26 + center + class + gender + serial),
+    // so the next serial is never below the highest serial ever issued in that bucket —
+    // including rolls of students who later moved, were rejected, or whose roll was retired.
+    // ========================================================
+    const ROLL_PATTERN = /^26([1-5])([0-9])([12])(\d{3})$/;
+    const CENTER_BY_CODE = Object.fromEntries(EXAM_CENTERS.map((c) => [c.code, c]));
+    const CLASS_BY_CODE = Object.fromEntries(EXAM_CLASSES.map((c) => [c.code, c]));
+    const GENDER_BY_CODE = Object.fromEntries(EXAM_GENDERS.map((g) => [g.code, g]));
+
+    // Bucket a roll was issued in, read from its digits (null for an unexpected format)
+    const decodeRoll = (roll) => {
+      const m = ROLL_PATTERN.exec(String(roll || "").trim());
+      if (!m) return null;
+      return {
+        bucketKey: `${m[1]}_${m[2]}_${m[3]}`,
+        center: CENTER_BY_CODE[m[1]],
+        studentClass: CLASS_BY_CODE[m[2]],
+        gender: GENDER_BY_CODE[m[3]],
+        serial: parseInt(m[4], 10),
+      };
+    };
+
+    // Highest serial ever issued per bucket: current rolls plus retired ones in roll_history
+    const computeRollSerialFloors = async () => {
+      const docs = await applicationCollection
+        .find(
+          { $or: [{ exam_roll: { $exists: true, $nin: [null, ""] } }, { "roll_history.old_roll": { $exists: true } }] },
+          { projection: { exam_roll: 1, "roll_history.old_roll": 1 } }
+        )
+        .toArray();
+      const floors = {};
+      const note = (roll) => {
+        const d = decodeRoll(roll);
+        if (d && d.serial > (floors[d.bucketKey] || 0)) floors[d.bucketKey] = d.serial;
+      };
+      for (const doc of docs) {
+        note(doc.exam_roll);
+        (doc.roll_history || []).forEach((h) => note(h.old_roll));
+      }
+      return floors;
+    };
+
+    const rollCounterId = (bucketKey) => `exam_roll_serial_${bucketKey}`;
+
+    // Reserves `count` consecutive serials in a bucket; returns the first one.
+    // Callers hold the roll_generation run lock.
+    const reserveRollSerials = async (bucketKey, count, floors) => {
+      const _id = rollCounterId(bucketKey);
+      await countersCollection.updateOne({ _id }, { $max: { seq: floors[bucketKey] || 0 } }, { upsert: true });
+      const counter = await countersCollection.findOneAndUpdate({ _id }, { $inc: { seq: count } }, { returnDocument: "after" });
+      return counter.seq - count + 1;
+    };
+
+    // Next serial a bucket would get, without reserving it (for previews)
+    const peekNextSerials = async (bucketKeys, floors) => {
+      const counters = await countersCollection
+        .find({ _id: { $in: bucketKeys.map(rollCounterId) } })
+        .toArray();
+      const seqById = Object.fromEntries(counters.map((c) => [c._id, c.seq || 0]));
+      return Object.fromEntries(
+        bucketKeys.map((b) => [b, Math.max(seqById[rollCounterId(b)] || 0, floors[b] || 0) + 1])
+      );
+    };
+
+    const buildRoll = (bucket, serial) =>
+      `${EXAM_YEAR}${bucket.center.code}${bucket.studentClass.code}${bucket.gender.code}${String(serial).padStart(3, "0")}`;
+
+    // Database-level guard against duplicate rolls. MongoDB refuses to create it while
+    // duplicates exist, so it switches itself on once they are resolved.
+    const ensureUniqueRollIndex = async () => {
+      try {
+        await applicationCollection.createIndex(
+          { exam_roll: 1 },
+          { unique: true, name: "exam_roll_unique", partialFilterExpression: { exam_roll: { $type: "string", $gt: "" } } }
+        );
+        return true;
+      } catch (err) {
+        return false;
+      }
+    };
+
+    // Lets the page stop a bulk SMS run early and free the lock straight away
+    app.post('/admin/run-locks/release', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { name, runId } = req.body || {};
+        if (!["bulk_sms", "roll_generation"].includes(name) || typeof runId !== "string") {
+          return res.status(400).send({ message: "Invalid lock release request" });
+        }
+        await releaseRunLock(name, runId);
+        res.send({ success: true });
+      } catch (err) {
+        console.error("Release run lock error:", err);
+        res.status(500).send({ message: "Failed to release lock" });
+      }
+    });
+
+    // ========================================================
+    // CHANGE BUCKET — fixing / changing a student's center, class or gender after a roll
+    // has been issued. The old roll is retired (kept in roll_history, never issued again),
+    // the student gets the next serial of the new bucket, and the change is logged.
+    // ========================================================
+    const DEFAULT_BUCKET_CHANGE_SMS =
+      "Dear {last_name}, your Aunkur Exam Roll is changed to {roll} (old {old_roll}). Download new Admit Card: aunkurctgnorth.org/admitcard - Aunkur'26";
+    const SMS_MAX_LENGTH = 160;
+    const SMS_SAMPLE_LAST_NAME = "Mohammadullah"; // a long last name, for the length check
+
+    const bucketLabel = (b) =>
+      b ? { key: b.bucketKey, center: b.center?.label_bn, class: b.studentClass?.label_bn, gender: b.gender?.label_bn } : null;
+
+    const getBucketChangeConfig = async () => {
+      const settings = await settingsCollection.findOne({}, { projection: { bucket_change_config: 1 } });
+      const cfg = settings?.bucket_change_config || {};
+      const deadline = cfg.deadline || "";
+      let deadlinePassed = false;
+      if (deadline) {
+        const dtStr = String(deadline).trim();
+        const normalized = /Z|[+-]\d{2}:?\d{2}$/.test(dtStr) ? dtStr : `${dtStr}+06:00`; // Bangladesh time, as publish_date_time
+        const target = new Date(normalized).getTime();
+        deadlinePassed = !isNaN(target) && Date.now() > target;
+      }
+      return { sms_template: cfg.sms_template || DEFAULT_BUCKET_CHANGE_SMS, deadline, deadlinePassed };
+    };
+
+    const formatBucketChangeSms = (template, cand, oldRoll) =>
+      formatSmsMessage(
+        template.replace(/{old_roll}/g, oldRoll || "").replace(/{center}/g, decodeRoll(cand.exam_roll)?.center?.label_en || ""),
+        cand
+      );
+
+    const normalizeSmsPhone = (raw) => {
+      const clean = String(raw || "").trim().replace(/[^0-9]/g, "");
+      const normalized = clean.startsWith("880") ? clean.slice(2) : clean;
+      return /^01[3-9]\d{8}$/.test(normalized) ? normalized : null;
+    };
+
+    const actorOf = (req) => ({ email: req.decoded?.email || null, name: req.user?.name || req.decoded?.email || "Admin" });
+
+    // A retired (old) roll entered together with the right phone → tell the student their new roll.
+    // `filter` is the portal's own lookup (roll + phone / candidate id).
+    const findRetiredRollNotice = async (filter, rollInput) => {
+      const { exam_roll, ...rest } = filter;
+      const owner = await applicationCollection.findOne(
+        { ...rest, "roll_history.old_roll": rollInput },
+        { projection: { exam_roll: 1 } }
+      );
+      if (!owner?.exam_roll || String(owner.exam_roll).trim() === rollInput) return null;
+      return `আপনার রোল নম্বর পরিবর্তিত হয়েছে। পুরনো রোল ${rollInput} বাতিল, নতুন রোল ${owner.exam_roll}। নতুন রোল নম্বর দিয়ে আবার চেষ্টা করুন।`;
+    };
+
+    // After a roll is issued, a center / class / gender edit that moves the student to another
+    // bucket must go through the Change Bucket page (new roll, old roll retired, logged).
+    // Returns the refusal message, or null when the edit is fine.
+    const rollBucketChangeBlock = (existing, changes) => {
+      if (!existing?.exam_roll || !changes) return null;
+      const touches = ["exam_center", "student_class", "gender"].some((k) => changes[k] !== undefined);
+      if (!touches) return null;
+      const before = resolveCandidateBucket(existing).bucketKey;
+      const after = resolveCandidateBucket({ ...existing, ...changes }).bucketKey;
+      if (before === after) return null;
+      return `এই শিক্ষার্থীর রোল (${existing.exam_roll}) দেওয়া হয়ে গেছে। কেন্দ্র, শ্রেণি বা লিঙ্গ পরিবর্তন করতে Exam Controller → Change Bucket পেজ ব্যবহার করুন — সেখানে নতুন রোল দেওয়া হবে ও পুরনো রোল বাতিল হবে। অন্য তথ্য আগের মতোই এডিট করা যাবে।`;
+    };
+
+    const MISMATCH_PROJECTION = {
+      name_en: 1, name_bn: 1, phone_number: 1, exam_roll: 1, exam_roll_bucket: 1, exam_roll_generated_at: 1,
+      exam_center: 1, student_class: 1, gender: 1, reg_status: 1, registration_type: 1, school_name: 1,
+      created_by: 1, last_edited_by: 1, admit_sms: 1, admit_card: 1, admit_downloaded: 1, roll_mismatch_ack: 1,
+    };
+
+    // Students whose roll digits no longer match their current center / class / gender
+    const findRollMismatches = async () => {
+      const docs = await applicationCollection
+        .find({ reg_status: "accepted", exam_roll: { $exists: true, $nin: [null, ""] } }, { projection: MISMATCH_PROJECTION })
+        .toArray();
+      const byRoll = new Map();
+      docs.forEach((d) => {
+        const r = String(d.exam_roll).trim();
+        byRoll.set(r, [...(byRoll.get(r) || []), d]);
+      });
+      const duplicates = [...byRoll.entries()].filter(([, list]) => list.length > 1).map(([roll, list]) => ({
+        roll,
+        students: list.map((d) => ({ _id: d._id, name_en: d.name_en, exam_center: d.exam_center })),
+      }));
+      const mismatches = [];
+      for (const d of docs) {
+        const fromRoll = decodeRoll(d.exam_roll);
+        const current = resolveCandidateBucket(d);
+        if (!fromRoll || fromRoll.bucketKey === current.bucketKey) continue;
+        const ack = d.roll_mismatch_ack;
+        const acknowledged = Boolean(ack && ack.roll === String(d.exam_roll).trim() && ack.bucketKey === current.bucketKey);
+        const partners = (byRoll.get(String(d.exam_roll).trim()) || []).filter((o) => String(o._id) !== String(d._id));
+        mismatches.push({ doc: d, fromRoll, current, acknowledged, duplicateWith: partners.map((p) => ({ _id: p._id, name_en: p.name_en, exam_center: p.exam_center })) });
+      }
+      return { mismatches, duplicates };
+    };
+
+    // Proposed new rolls (dry run): next free serials of each target bucket, A–Z by name
+    const proposeRolls = async (entries) => {
+      const floors = await computeRollSerialFloors();
+      const next = await peekNextSerials([...new Set(entries.map((e) => e.target.bucketKey))], floors);
+      const sorted = [...entries].sort(
+        (a, b) =>
+          a.target.bucketKey.localeCompare(b.target.bucketKey) ||
+          (a.doc.name_en || "").trim().toUpperCase().localeCompare((b.doc.name_en || "").trim().toUpperCase())
+      );
+      const proposals = {};
+      for (const e of sorted) {
+        proposals[String(e.doc._id)] = buildRoll(e.target, next[e.target.bucketKey]++);
+      }
+      return proposals;
+    };
+
+    const changedFields = (fromRoll, current) =>
+      [
+        fromRoll.center.code !== current.center.code && "center",
+        fromRoll.studentClass.code !== current.studentClass.code && "class",
+        fromRoll.gender.code !== current.gender.code && "gender",
+      ].filter(Boolean);
+
+    // GET overview: settings, problem list (with proposed rolls), duplicates, guard status
+    app.get('/admin/bucket-change/overview', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const [config, { mismatches, duplicates }, indexes] = await Promise.all([
+          getBucketChangeConfig(),
+          findRollMismatches(),
+          applicationCollection.indexes(),
+        ]);
+        const open = mismatches.filter((m) => !m.acknowledged);
+        const proposals = await proposeRolls(open.map((m) => ({ doc: m.doc, target: m.current })));
+        const rows = mismatches.map((m) => ({
+          _id: m.doc._id,
+          name_en: m.doc.name_en || "",
+          name_bn: m.doc.name_bn || "",
+          phone_number: m.doc.phone_number || "",
+          school_name: m.doc.school_name || "",
+          registration_type: m.doc.registration_type === "offline" ? "offline" : "online",
+          exam_roll: m.doc.exam_roll,
+          roll_bucket: bucketLabel(m.fromRoll),
+          current_bucket: bucketLabel(m.current),
+          current_values: { exam_center: m.doc.exam_center, student_class: m.doc.student_class, gender: m.doc.gender },
+          changed: changedFields(m.fromRoll, m.current),
+          entry_owner: m.doc.created_by || null,
+          last_edited_by: m.doc.last_edited_by || null,
+          sms: { sent: Boolean(m.doc.admit_sms?.sent), sentAt: m.doc.admit_sms?.sentAt || null, sentCount: m.doc.admit_sms?.sentCount || 0 },
+          downloaded: Boolean(m.doc.admit_card?.downloaded || m.doc.admit_downloaded),
+          duplicate_with: m.duplicateWith,
+          acknowledged: m.acknowledged ? m.doc.roll_mismatch_ack : null,
+          proposed_roll: m.acknowledged ? null : proposals[String(m.doc._id)],
+        }));
+        res.send({
+          success: true,
+          config: { ...config, default_sms_template: DEFAULT_BUCKET_CHANGE_SMS, sms_max_length: SMS_MAX_LENGTH },
+          mismatches: rows,
+          duplicates,
+          duplicateGuardActive: indexes.some((i) => i.name === "exam_roll_unique"),
+        });
+      } catch (err) {
+        console.error("Bucket change overview error:", err);
+        res.status(500).send({ message: "Failed to load bucket change overview" });
+      }
+    });
+
+    // Valid choices for a transfer (same keys the registration forms store)
+    const parseTargetValues = (item) => {
+      const center = String(item.exam_center || "").trim().toLowerCase();
+      const studentClass = String(item.student_class || "").trim().toLowerCase();
+      const gender = String(item.gender || "").trim().toLowerCase();
+      if (!CENTER_LOOKUP[center] || !EXAM_CLASSES.some((c) => c.key === studentClass) || !["male", "female"].includes(gender)) {
+        return null;
+      }
+      return { exam_center: center, student_class: studentClass, gender };
+    };
+
+    // POST preview: proposed roll for each requested change (nothing is written)
+    app.post('/admin/bucket-change/preview', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 200) : [];
+        const ids = items.filter((i) => ObjectId.isValid(i.id)).map((i) => new ObjectId(i.id));
+        const docs = await applicationCollection.find({ _id: { $in: ids } }, { projection: MISMATCH_PROJECTION }).toArray();
+        const byId = Object.fromEntries(docs.map((d) => [String(d._id), d]));
+        const entries = [];
+        const results = items.map((item) => {
+          const doc = byId[item.id];
+          if (!doc) return { id: item.id, ok: false, message: "শিক্ষার্থী পাওয়া যায়নি।" };
+          if (!doc.exam_roll) return { id: item.id, ok: false, message: "এই শিক্ষার্থীর এখনো রোল নেই — সাধারণ এডিট ব্যবহার করুন।" };
+          const values = item.exam_center === undefined ? null : parseTargetValues(item);
+          if (item.exam_center !== undefined && !values) return { id: item.id, ok: false, message: "কেন্দ্র, শ্রেণি বা লিঙ্গ সঠিক নয়।" };
+          const target = resolveCandidateBucket(values ? { ...doc, ...values } : doc);
+          const fromRoll = decodeRoll(doc.exam_roll);
+          if (fromRoll && fromRoll.bucketKey === target.bucketKey) {
+            return { id: item.id, ok: false, message: "নতুন বাকেট রোলের বাকেটের সাথে একই — রোল পরিবর্তনের দরকার নেই।" };
+          }
+          entries.push({ doc, target });
+          return { id: item.id, ok: true, old_roll: doc.exam_roll, from_bucket: bucketLabel(fromRoll), to_bucket: bucketLabel(target) };
+        });
+        const proposals = await proposeRolls(entries);
+        results.forEach((r) => { if (r.ok) r.proposed_roll = proposals[r.id]; });
+        res.send({ success: true, results, config: await getBucketChangeConfig() });
+      } catch (err) {
+        console.error("Bucket change preview error:", err);
+        res.status(500).send({ message: "Failed to preview bucket change" });
+      }
+    });
+
+    // POST apply: give each student a new roll in their (new) bucket and retire the old one.
+    // mode "reroll": keep current data (fixes a mismatch); mode "transfer": set new center/class/gender.
+    // The page sends a few students per request (SMS can be slow).
+    app.post('/admin/bucket-change/apply', verifyToken, verifyAdmin, async (req, res) => {
+      let lock = null;
+      try {
+        const { mode = "reroll", items: rawItems, reason = "", sendSms = false } = req.body || {};
+        const items = Array.isArray(rawItems) ? rawItems.slice(0, 50) : [];
+        if (!["reroll", "transfer"].includes(mode) || items.length === 0) {
+          return res.status(400).send({ message: "Invalid bucket change request" });
+        }
+        if (!String(reason).trim()) {
+          return res.status(400).send({ message: "পরিবর্তনের কারণ লিখুন।" });
+        }
+        const config = await getBucketChangeConfig();
+        if (config.deadlinePassed) {
+          return res.status(403).send({ message: "বাকেট পরিবর্তনের শেষ সময় পার হয়ে গেছে। প্রয়োজনে Change Bucket পেজের সেটিংসে সময় বাড়ান।" });
+        }
+
+        // Same lock as roll generation: serials of a bucket are handed out by one run at a time
+        lock = await acquireRunLock("roll_generation", req.decoded?.email || "Admin");
+        if (!lock.runId) {
+          return res.status(409).send({ message: `এখন রোল জেনারেশন বা অন্য একটি বাকেট পরিবর্তন চলছে${formatLockHolder(lock.heldBy)}। কিছুক্ষণ পর আবার চেষ্টা করুন।` });
+        }
+
+        const ids = items.filter((i) => ObjectId.isValid(i.id)).map((i) => new ObjectId(i.id));
+        const docs = await applicationCollection.find({ _id: { $in: ids } }).project({ ...MISMATCH_PROJECTION, roll_history: 1 }).toArray();
+        const byId = Object.fromEntries(docs.map((d) => [String(d._id), d]));
+
+        const results = [];
+        const entries = [];
+        for (const item of items) {
+          const doc = byId[item.id];
+          if (!doc || !doc.exam_roll || doc.reg_status !== "accepted") {
+            results.push({ id: item.id, ok: false, message: "শিক্ষার্থী পাওয়া যায়নি বা রোল নেই।" });
+            continue;
+          }
+          const values = mode === "transfer" ? parseTargetValues(item) : null;
+          if (mode === "transfer" && !values) {
+            results.push({ id: item.id, ok: false, message: "কেন্দ্র, শ্রেণি বা লিঙ্গ সঠিক নয়।" });
+            continue;
+          }
+          const target = resolveCandidateBucket(values ? { ...doc, ...values } : doc);
+          const fromRoll = decodeRoll(doc.exam_roll);
+          if (fromRoll && fromRoll.bucketKey === target.bucketKey) {
+            results.push({ id: item.id, ok: false, message: mode === "transfer" ? "নতুন বাকেট রোলের নিজের বাকেটের সাথে একই — রোল বদলানোর দরকার নেই। তথ্য রোলের সাথে মেলাতে 'আগের তথ্যে ফেরত' ব্যবহার করুন।" : "রোল ইতিমধ্যে সঠিক বাকেটে — পরিবর্তনের দরকার নেই।" });
+            continue;
+          }
+          entries.push({ doc, values, target, fromRoll });
+        }
+
+        // A–Z by name within each new bucket, as roll generation orders them
+        entries.sort(
+          (a, b) =>
+            a.target.bucketKey.localeCompare(b.target.bucketKey) ||
+            (a.doc.name_en || "").trim().toUpperCase().localeCompare((b.doc.name_en || "").trim().toUpperCase())
+        );
+        const floors = await computeRollSerialFloors();
+        const nextSerial = {};
+        for (const bucketKey of [...new Set(entries.map((e) => e.target.bucketKey))]) {
+          const count = entries.filter((e) => e.target.bucketKey === bucketKey).length;
+          nextSerial[bucketKey] = await reserveRollSerials(bucketKey, count, floors);
+        }
+
+        const actor = actorOf(req);
+        const now = new Date().toISOString();
+        for (const e of entries) {
+          const oldRoll = String(e.doc.exam_roll).trim();
+          const newRoll = buildRoll(e.target, nextSerial[e.target.bucketKey]++);
+          const before = { exam_center: e.doc.exam_center ?? null, student_class: e.doc.student_class ?? null, gender: e.doc.gender ?? null };
+          const after = e.values ? { ...e.values } : before;
+          const historyEntry = {
+            type: mode,
+            old_roll: oldRoll,
+            new_roll: newRoll,
+            old_bucket: e.fromRoll?.bucketKey || null,
+            new_bucket: e.target.bucketKey,
+            before,
+            after,
+            reason: String(reason).trim().slice(0, 500),
+            by: actor,
+            at: now,
+          };
+          // Only if the roll is still the one we read (guards against a parallel edit)
+          const update = await applicationCollection.updateOne(
+            { _id: e.doc._id, exam_roll: e.doc.exam_roll },
+            {
+              $set: {
+                ...(e.values || {}),
+                exam_roll: newRoll,
+                exam_roll_bucket: e.target.bucketKey,
+                exam_roll_generated_at: now,
+                exam_roll_generated_by: actor.email || "Admin",
+                admit_downloaded: false,
+                "admit_card.downloaded": false,
+                "admit_sms.sent": false,
+                "admit_sms.previous_roll": oldRoll,
+                last_edited_by: { ...actor, editedAt: now },
+              },
+              $unset: { roll_mismatch_ack: "" },
+              $push: { roll_history: historyEntry },
+            }
+          );
+          if (update.modifiedCount === 0) {
+            results.push({ id: String(e.doc._id), ok: false, message: "এই সময়ে শিক্ষার্থীর তথ্য বদলে গেছে — তালিকা রিফ্রেশ করে আবার চেষ্টা করুন।" });
+            continue;
+          }
+
+          const result = { id: String(e.doc._id), ok: true, name_en: e.doc.name_en, old_roll: oldRoll, new_roll: newRoll, sms: null };
+          if (sendSms) {
+            const phone = normalizeSmsPhone(e.doc.phone_number);
+            const message = formatBucketChangeSms(config.sms_template, { ...e.doc, exam_roll: newRoll }, oldRoll);
+            if (!phone) {
+              result.sms = { sent: false, error: "ফোন নম্বর সঠিক নয়" };
+            } else {
+              try {
+                await sendBulkSMS([phone], message);
+                await applicationCollection.updateOne(
+                  { _id: e.doc._id },
+                  {
+                    $set: {
+                      "admit_sms.sent": true,
+                      "admit_sms.sentAt": new Date().toISOString(),
+                      "admit_sms.lastSentBy": actor.email || "Admin",
+                      "admit_sms.phone": phone,
+                      "admit_sms.lastMessage": message,
+                      "admit_sms.failed": false,
+                      "admit_sms.error": null,
+                    },
+                    $inc: { "admit_sms.sentCount": 1 },
+                  }
+                );
+                result.sms = { sent: true, message };
+              } catch (smsErr) {
+                await applicationCollection.updateOne(
+                  { _id: e.doc._id },
+                  { $set: { "admit_sms.failed": true, "admit_sms.error": smsErr.message, "admit_sms.failedAt": new Date().toISOString() } }
+                );
+                result.sms = { sent: false, error: smsErr.message };
+              }
+            }
+            await applicationCollection.updateOne(
+              { _id: e.doc._id, roll_history: { $elemMatch: { at: now, new_roll: newRoll } } },
+              { $set: { "roll_history.$.sms": result.sms } }
+            );
+          }
+          results.push(result);
+        }
+
+        // Duplicates may now be gone; try to switch on the database guard
+        const duplicateGuardActive = await ensureUniqueRollIndex();
+        res.send({ success: true, results, duplicateGuardActive });
+      } catch (err) {
+        console.error("Bucket change apply error:", err);
+        res.status(500).send({ message: "Failed to apply bucket change: " + (err.message || "Unknown error") });
+      } finally {
+        if (lock?.runId) {
+          await releaseRunLock("roll_generation", lock.runId).catch((e) => console.error("Release roll lock error:", e.message));
+        }
+      }
+    });
+
+    // POST revert: put center/class/gender back to what the roll says (the edit was a mistake).
+    // The roll stays; the admit card must be downloaded again.
+    app.post('/admin/bucket-change/revert', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { ids: rawIds, reason = "" } = req.body || {};
+        const ids = (Array.isArray(rawIds) ? rawIds.slice(0, 200) : []).filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
+        if (!ids.length || !String(reason).trim()) {
+          return res.status(400).send({ message: "শিক্ষার্থী নির্বাচন করুন এবং কারণ লিখুন।" });
+        }
+        const docs = await applicationCollection.find({ _id: { $in: ids } }).project(MISMATCH_PROJECTION).toArray();
+        const actor = actorOf(req);
+        const now = new Date().toISOString();
+        const results = [];
+        for (const doc of docs) {
+          const fromRoll = decodeRoll(doc.exam_roll);
+          if (!fromRoll || fromRoll.bucketKey === resolveCandidateBucket(doc).bucketKey) {
+            results.push({ id: String(doc._id), ok: false, message: "ফেরত নেওয়ার মতো অমিল নেই।" });
+            continue;
+          }
+          const before = { exam_center: doc.exam_center ?? null, student_class: doc.student_class ?? null, gender: doc.gender ?? null };
+          const after = { exam_center: fromRoll.center.key, student_class: fromRoll.studentClass.key, gender: fromRoll.gender.key };
+          await applicationCollection.updateOne(
+            { _id: doc._id, exam_roll: doc.exam_roll },
+            {
+              $set: { ...after, admit_downloaded: false, "admit_card.downloaded": false, last_edited_by: { ...actor, editedAt: now } },
+              $unset: { roll_mismatch_ack: "" },
+              $push: { roll_history: { type: "revert", old_roll: doc.exam_roll, new_roll: doc.exam_roll, old_bucket: fromRoll.bucketKey, new_bucket: fromRoll.bucketKey, before, after, reason: String(reason).trim().slice(0, 500), by: actor, at: now } },
+            }
+          );
+          results.push({ id: String(doc._id), ok: true, name_en: doc.name_en, roll: doc.exam_roll });
+        }
+        res.send({ success: true, results });
+      } catch (err) {
+        console.error("Bucket change revert error:", err);
+        res.status(500).send({ message: "Failed to revert" });
+      }
+    });
+
+    // POST keep: leave the roll as is on purpose (removes it from the problem list)
+    app.post('/admin/bucket-change/keep', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { ids: rawIds, reason = "" } = req.body || {};
+        const ids = (Array.isArray(rawIds) ? rawIds.slice(0, 200) : []).filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
+        if (!ids.length || !String(reason).trim()) {
+          return res.status(400).send({ message: "শিক্ষার্থী নির্বাচন করুন এবং কারণ লিখুন।" });
+        }
+        const docs = await applicationCollection.find({ _id: { $in: ids } }).project(MISMATCH_PROJECTION).toArray();
+        const actor = actorOf(req);
+        const now = new Date().toISOString();
+        const results = [];
+        for (const doc of docs) {
+          const fromRoll = decodeRoll(doc.exam_roll);
+          const current = resolveCandidateBucket(doc);
+          if (!fromRoll || fromRoll.bucketKey === current.bucketKey) {
+            results.push({ id: String(doc._id), ok: false, message: "অমিল নেই।" });
+            continue;
+          }
+          const ack = { roll: String(doc.exam_roll).trim(), bucketKey: current.bucketKey, reason: String(reason).trim().slice(0, 500), by: actor, at: now };
+          await applicationCollection.updateOne(
+            { _id: doc._id },
+            {
+              $set: { roll_mismatch_ack: ack },
+              $push: { roll_history: { type: "keep", old_roll: ack.roll, new_roll: ack.roll, old_bucket: fromRoll.bucketKey, new_bucket: current.bucketKey, reason: ack.reason, by: actor, at: now } },
+            }
+          );
+          results.push({ id: String(doc._id), ok: true, name_en: doc.name_en, roll: doc.exam_roll });
+        }
+        res.send({ success: true, results });
+      } catch (err) {
+        console.error("Bucket change keep error:", err);
+        res.status(500).send({ message: "Failed to mark as kept" });
+      }
+    });
+
+    // GET history: every roll change / revert / keep, newest first
+    app.get('/admin/bucket-change/history', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const rows = await applicationCollection
+          .aggregate([
+            { $match: { "roll_history.0": { $exists: true } } },
+            { $project: { name_en: 1, name_bn: 1, phone_number: 1, exam_roll: 1, created_by: 1, roll_history: 1 } },
+            { $unwind: "$roll_history" },
+            { $sort: { "roll_history.at": -1 } },
+            { $limit: 5000 },
+          ])
+          .toArray();
+        res.send({
+          success: true,
+          history: rows.map((r) => ({
+            student_id: r._id,
+            name_en: r.name_en || "",
+            name_bn: r.name_bn || "",
+            phone_number: r.phone_number || "",
+            current_roll: r.exam_roll || "",
+            entry_owner: r.created_by || null,
+            ...r.roll_history,
+          })),
+        });
+      } catch (err) {
+        console.error("Bucket change history error:", err);
+        res.status(500).send({ message: "Failed to load bucket change history" });
+      }
+    });
+
+    // POST settings: change-SMS template (max 160 characters) and the change deadline
+    app.post('/admin/bucket-change/settings', verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const template = String(req.body?.sms_template || "").trim() || DEFAULT_BUCKET_CHANGE_SMS;
+        const deadline = String(req.body?.deadline || "").trim();
+        if (!template.includes("{roll}")) {
+          return res.status(400).send({ message: "এসএমএসে অবশ্যই {roll} থাকতে হবে।" });
+        }
+        const sample = formatSmsMessage(
+          template.replace(/{old_roll}/g, "26181010").replace(/{center}/g, "Chawkbazar"),
+          { name_en: `Student ${SMS_SAMPLE_LAST_NAME}`, exam_roll: "26481031", student_class: "eight" }
+        );
+        if (sample.length > SMS_MAX_LENGTH) {
+          return res.status(400).send({ message: `এসএমএস ${SMS_MAX_LENGTH} অক্ষরের বেশি হচ্ছে (নমুনায় ${sample.length})। লেখা ছোট করুন।` });
+        }
+        if (deadline && isNaN(new Date(/Z|[+-]\d{2}:?\d{2}$/.test(deadline) ? deadline : `${deadline}+06:00`).getTime())) {
+          return res.status(400).send({ message: "শেষ সময়টি সঠিক নয়।" });
+        }
+        await getSettings();
+        await settingsCollection.updateOne(
+          {},
+          { $set: { bucket_change_config: { sms_template: template, deadline, updatedAt: new Date().toISOString(), updatedBy: req.decoded?.email || "Admin" } } }
+        );
+        res.send({ success: true, config: await getBucketChangeConfig(), sample, sampleLength: sample.length });
+      } catch (err) {
+        console.error("Bucket change settings error:", err);
+        res.status(500).send({ message: "Failed to save settings" });
+      }
+    });
+
     // 1. GET /admin/exam-rolls/summary - Bucket matrix and overall roll stats
     app.get('/admin/exam-rolls/summary', verifyToken, verifyAdmin, async (req, res) => {
       try {
@@ -1962,6 +2641,7 @@ async function run() {
 
     // 2. POST /admin/exam-rolls/generate - Generate roll numbers
     app.post('/admin/exam-rolls/generate', verifyToken, verifyAdmin, async (req, res) => {
+      let rollLock = null;
       try {
         const settings = await settingsCollection.findOne({}) || {};
         if (settings.admitCardLocked) {
@@ -1970,11 +2650,24 @@ async function run() {
           });
         }
 
+        // One generation at a time: two parallel runs would both continue from the same
+        // highest serial and hand out the same roll numbers
+        rollLock = await acquireRunLock("roll_generation", req.decoded?.email || "Admin");
+        if (!rollLock.runId) {
+          return res.status(409).send({
+            message: `অন্য একটি রোল জেনারেশন এখন চলছে${formatLockHolder(rollLock.heldBy)}। শেষ হলে আবার চেষ্টা করুন।`,
+          });
+        }
+
         const { bucketKey: targetBucketKey } = req.body || {};
 
-        // Fetch all accepted applications
+        // Fetch all accepted applications — only the fields roll generation reads
+        // (bucket: center/class/gender, existing roll, name for A-Z order)
         const query = { reg_status: "accepted" };
-        const acceptedApps = await applicationCollection.find(query).toArray();
+        const acceptedApps = await applicationCollection
+          .find(query)
+          .project({ _id: 1, exam_center: 1, student_class: 1, gender: 1, exam_roll: 1, name_en: 1 })
+          .toArray();
 
         // Group into buckets
         const bucketBuckets = {};
@@ -1990,23 +2683,18 @@ async function run() {
               center,
               studentClass,
               gender,
-              assignedMaxSerial: 0,
               unassigned: [],
             };
           }
 
-          if (app.exam_roll) {
-            const serialPart = parseInt(String(app.exam_roll).slice(-3), 10);
-            if (!isNaN(serialPart) && serialPart > bucketBuckets[bucketKey].assignedMaxSerial) {
-              bucketBuckets[bucketKey].assignedMaxSerial = serialPart;
-            }
-          } else {
+          if (!app.exam_roll) {
             bucketBuckets[bucketKey].unassigned.push(app);
           }
         }
 
         const bulkOps = [];
         let totalGenerated = 0;
+        const serialFloors = await computeRollSerialFloors();
 
         for (const bucketKey of Object.keys(bucketBuckets)) {
           const bucket = bucketBuckets[bucketKey];
@@ -2019,10 +2707,12 @@ async function run() {
             return nameA.localeCompare(nameB);
           });
 
-          let currentSerial = bucket.assignedMaxSerial;
+          // Serials come from the bucket's counter, never below the highest serial ever issued
+          // in this bucket — so a student moving away can never free their number for reuse
+          let currentSerial = (await reserveRollSerials(bucketKey, bucket.unassigned.length, serialFloors)) - 1;
           for (const cand of bucket.unassigned) {
             currentSerial++;
-            const rollStr = `${EXAM_YEAR}${bucket.center.code}${bucket.studentClass.code}${bucket.gender.code}${String(currentSerial).padStart(3, "0")}`;
+            const rollStr = buildRoll(bucket, currentSerial);
             bulkOps.push({
               updateOne: {
                 filter: { _id: cand._id },
@@ -2052,6 +2742,12 @@ async function run() {
       } catch (err) {
         console.error("Generate rolls error:", err);
         res.status(500).send({ message: "Failed to generate exam rolls" });
+      } finally {
+        if (rollLock?.runId) {
+          await releaseRunLock("roll_generation", rollLock.runId).catch((e) =>
+            console.error("Release roll lock error:", e.message)
+          );
+        }
       }
     });
 
@@ -2457,6 +3153,41 @@ async function run() {
       }
     });
 
+    // Fields the admit card list / bulk data responses read (including venue resolution:
+    // exam_center, student_class, gender, exam_roll)
+    const ADMIT_CARD_PROJECTION = {
+      _id: 1,
+      name_en: 1,
+      name_bn: 1,
+      father_name: 1,
+      mother_name: 1,
+      gender: 1,
+      student_class: 1,
+      student_section: 1,
+      student_roll: 1,
+      school_name: 1,
+      phone_number: 1,
+      whatsapp_number: 1,
+      present_area: 1,
+      present_thana: 1,
+      present_zilla: 1,
+      form_number: 1,
+      paper_serial_no: 1,
+      offline_serial: 1,
+      exam_center: 1,
+      exam_roll: 1,
+      exam_roll_bucket: 1,
+      branch: 1,
+      sub_branch: 1,
+      registration_type: 1,
+      admit_downloaded: 1,
+      admit_card: 1,
+      admit_sms: 1,
+      office_note: 1,
+      note: 1,
+      admin_note: 1,
+    };
+
     // 10. GET /admin/admit-cards/list - Paginated list of candidates for admit card management
     app.get('/admin/admit-cards/list', verifyToken, verifyAdmin, async (req, res) => {
       try {
@@ -2541,36 +3272,39 @@ async function run() {
         }
 
         const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
-        const [candidates, total, statsDownloaded, statsPending, statsSmsSent, statsSmsPending] = await Promise.all([
+        const [candidates, total, [statsCounts]] = await Promise.all([
           applicationCollection
             .find(filter)
             .sort({ exam_roll: 1, name_en: 1 })
             .skip(skip)
             .limit(parseInt(limit, 10))
+            .project(ADMIT_CARD_PROJECTION)
             .toArray(),
           applicationCollection.countDocuments(filter),
-          applicationCollection.countDocuments({
-            reg_status: "accepted",
-            exam_roll: { $exists: true, $nin: [null, ""] },
-            $or: [{ admit_downloaded: true }, { "admit_card.downloaded": true }],
-          }),
-          applicationCollection.countDocuments({
-            reg_status: "accepted",
-            exam_roll: { $exists: true, $nin: [null, ""] },
-            admit_downloaded: { $ne: true },
-            "admit_card.downloaded": { $ne: true },
-          }),
-          applicationCollection.countDocuments({
-            reg_status: "accepted",
-            exam_roll: { $exists: true, $nin: [null, ""] },
-            "admit_sms.sent": true,
-          }),
-          applicationCollection.countDocuments({
-            reg_status: "accepted",
-            exam_roll: { $exists: true, $nin: [null, ""] },
-            "admit_sms.sent": { $ne: true },
-          }),
+          // The four overall counts in one pass, with the same conditions as before
+          applicationCollection.aggregate([
+            { $match: { reg_status: "accepted", exam_roll: { $exists: true, $nin: [null, ""] } } },
+            {
+              $facet: {
+                downloaded: [
+                  { $match: { $or: [{ admit_downloaded: true }, { "admit_card.downloaded": true }] } },
+                  { $count: "n" },
+                ],
+                pending: [
+                  { $match: { admit_downloaded: { $ne: true }, "admit_card.downloaded": { $ne: true } } },
+                  { $count: "n" },
+                ],
+                smsSent: [{ $match: { "admit_sms.sent": true } }, { $count: "n" }],
+                smsPending: [{ $match: { "admit_sms.sent": { $ne: true } } }, { $count: "n" }],
+              },
+            },
+          ]).toArray(),
         ]);
+        const facetCount = (key) => statsCounts?.[key]?.[0]?.n || 0;
+        const statsDownloaded = facetCount("downloaded");
+        const statsPending = facetCount("pending");
+        const statsSmsSent = facetCount("smsSent");
+        const statsSmsPending = facetCount("smsPending");
 
         const enrichedCandidates = candidates.map((cand) => {
           const venue = resolveCandidateVenue(cand, allocations);
@@ -2704,6 +3438,7 @@ async function run() {
           .find(filter)
           .sort({ exam_roll: 1 })
           .limit(parseInt(limit, 10))
+          .project(ADMIT_CARD_PROJECTION)
           .toArray();
 
         const enrichedCandidates = candidates.map((cand) => {
@@ -2814,7 +3549,13 @@ async function run() {
     });
 
     // 13. POST /admin/admit-card/send-bulk-sms - Send SMS to students with generated rolls (Anti-Duplicate Guarded)
+    // Without `limit`, one request sends to every target (original behaviour).
+    // With `limit`, one chunk is sent per request: candidates in _id order after `cursor`;
+    // the page keeps calling with the returned `nextCursor` and `runId` until `done`.
+    // Either way only one bulk run can be active at a time (run lock "bulk_sms").
     app.post('/admin/admit-card/send-bulk-sms', verifyToken, verifyAdmin, async (req, res) => {
+      let smsLock = null;
+      let releaseWhenFinished = false;
       try {
         const {
           target = "unsent", // "unsent" | "all" | "selected"
@@ -2824,8 +3565,17 @@ async function run() {
           center,
           student_class,
           gender,
-          custom_template
+          custom_template,
+          limit,
+          cursor,
+          runId,
         } = req.body || {};
+
+        const isChunked = limit !== undefined && limit !== null;
+        const chunkSize = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+        if (cursor !== undefined && cursor !== null && !ObjectId.isValid(cursor)) {
+          return res.status(400).send({ message: "Invalid cursor" });
+        }
 
         const settings = await settingsCollection.findOne({}) || {};
         const admitConfig = settings.admit_card_config || {};
@@ -2851,16 +3601,45 @@ async function run() {
           if (gender && gender !== "all") filter.gender = gender;
         }
 
-        const candidates = await applicationCollection.find(filter).toArray();
+        // One bulk run at a time: a parallel run would read the same "unsent" list and
+        // send everyone a second SMS. Later chunks of a run carry its runId.
+        const lockedBy = req.decoded?.email || "Admin";
+        if (isChunked && runId) {
+          if (!(await refreshRunLock("bulk_sms", runId))) {
+            return res.status(409).send({
+              message: "এই এসএমএস রানটির মেয়াদ শেষ হয়ে গেছে বা অন্য কেউ নতুন রান শুরু করেছেন। পেজ রিফ্রেশ করে আবার চেষ্টা করুন।",
+            });
+          }
+          smsLock = { runId };
+        } else {
+          smsLock = await acquireRunLock("bulk_sms", lockedBy);
+          if (!smsLock.runId) {
+            return res.status(409).send({
+              message: `অন্য একটি বাল্ক এসএমএস পাঠানো এখন চলছে${formatLockHolder(smsLock.heldBy)}। শেষ হলে আবার চেষ্টা করুন।`,
+            });
+          }
+        }
+        // The original single-request mode always frees the lock when it returns
+        releaseWhenFinished = !isChunked;
+
+        // Only the fields the SMS step reads (phone, and name/roll/class for the message)
+        const SMS_PROJECTION = { _id: 1, phone_number: 1, name_en: 1, name_bn: 1, exam_roll: 1, student_class: 1 };
+        const chunkFilter = (afterId) => (afterId ? { $and: [filter, { _id: { $gt: new ObjectId(afterId) } }] } : filter);
+
+        const candidates = isChunked
+          ? await applicationCollection.find(chunkFilter(cursor)).sort({ _id: 1 }).limit(chunkSize).project(SMS_PROJECTION).toArray()
+          : await applicationCollection.find(filter).project(SMS_PROJECTION).toArray();
 
         if (!candidates.length) {
+          releaseWhenFinished = true;
           return res.send({
             success: true,
-            message: "কোনো এসএমএস পাঠানোর বাকি শিক্ষার্থী পাওয়া যায়নি (No candidates pending SMS).",
+            message: "কোনো এসএমএস পাঠানোর বাকি শিক্ষার্থী পাওয়া যায়নি (No candidates pending SMS).",
             sentCount: 0,
             failedCount: 0,
             skippedCount: 0,
             totalTargeted: 0,
+            ...(isChunked ? { runId: smsLock.runId, processed: 0, nextCursor: cursor || null, remaining: 0, done: true } : {}),
           });
         }
 
@@ -2918,22 +3697,55 @@ async function run() {
             }
           }));
 
+          // Keep the run lock alive during long runs
+          await refreshRunLock("bulk_sms", smsLock.runId);
+
           if (i + BATCH_SIZE < candidates.length) {
             await new Promise((r) => setTimeout(r, 250));
           }
         }
 
+        const message = `${sentCount} জন প্রার্থীর কাছে সফলভাবে এসএমএস পাঠানো হয়েছে। (ব্যর্থ: ${failedCount}, বাদ: ${skippedCount})`;
+
+        if (!isChunked) {
+          return res.send({
+            success: true,
+            message,
+            sentCount,
+            failedCount,
+            skippedCount,
+            totalTargeted: candidates.length,
+          });
+        }
+
+        // Each candidate is considered once per run: the next chunk starts after the last _id here
+        const nextCursor = String(candidates[candidates.length - 1]._id);
+        const remaining = await applicationCollection.countDocuments(chunkFilter(nextCursor));
+        if (remaining === 0) releaseWhenFinished = true;
+
         res.send({
           success: true,
-          message: `${sentCount} জন প্রার্থীর কাছে সফলভাবে এসএমএস পাঠানো হয়েছে। (ব্যর্থ: ${failedCount}, বাদ: ${skippedCount})`,
+          message,
           sentCount,
           failedCount,
           skippedCount,
           totalTargeted: candidates.length,
+          runId: smsLock.runId,
+          processed: candidates.length,
+          nextCursor,
+          remaining,
+          done: remaining === 0,
         });
       } catch (err) {
         console.error("Bulk SMS error:", err);
+        releaseWhenFinished = true;
         res.status(500).send({ message: "Failed to send bulk SMS: " + (err.message || "Unknown error") });
+      } finally {
+        if (releaseWhenFinished && smsLock?.runId) {
+          await releaseRunLock("bulk_sms", smsLock.runId).catch((e) =>
+            console.error("Release SMS lock error:", e.message)
+          );
+        }
       }
     });
 
@@ -3415,9 +4227,11 @@ async function run() {
 
         const cand = await applicationCollection.findOne(filter);
         if (!cand) {
+          const retiredNotice = await findRetiredRollNotice(filter, rollInput);
           return res.status(401).send({
             success: false,
-            message: "মোবাইল নম্বর ও ৮ ডিজিটের রোল নম্বরের মিল পাওয়া যায়নি। অনুগ্রহ করে সঠিক রোল নম্বর দিন।",
+            rollChanged: Boolean(retiredNotice),
+            message: retiredNotice || "মোবাইল নম্বর ও ৮ ডিজিটের রোল নম্বরের মিল পাওয়া যায়নি। অনুগ্রহ করে সঠিক রোল নম্বর দিন।",
           });
         }
 
@@ -3547,9 +4361,11 @@ async function run() {
 
         const cand = await applicationCollection.findOne(filter);
         if (!cand) {
+          const retiredNotice = await findRetiredRollNotice(filter, rollInput);
           return res.status(404).send({
             success: false,
-            message: "প্রার্থীর তথ্য পাওয়া যায়নি। অনুগ্রহ করে সঠিক রোল ও ফোন নম্বর নিশ্চিত করুন।",
+            rollChanged: Boolean(retiredNotice),
+            message: retiredNotice || "প্রার্থীর তথ্য পাওয়া যায়নি। অনুগ্রহ করে সঠিক রোল ও ফোন নম্বর নিশ্চিত করুন।",
           });
         }
 
@@ -3735,11 +4551,17 @@ async function run() {
           applicationCollection.countDocuments(filter),
         ]);
 
-        const [pendingCount, approvedCount, rejectedCount] = await Promise.all([
-          applicationCollection.countDocuments({ "edit_request.status": "pending" }),
-          applicationCollection.countDocuments({ "edit_request.status": "approved" }),
-          applicationCollection.countDocuments({ "edit_request.status": "rejected" }),
-        ]);
+        // Pending / approved / rejected counts in one pass
+        const statusRows = await applicationCollection
+          .aggregate([
+            { $match: { "edit_request.status": { $in: ["pending", "approved", "rejected"] } } },
+            { $group: { _id: "$edit_request.status", count: { $sum: 1 } } },
+          ])
+          .toArray();
+        const countFor = (status) => statusRows.find((r) => r._id === status)?.count || 0;
+        const pendingCount = countFor("pending");
+        const approvedCount = countFor("approved");
+        const rejectedCount = countFor("rejected");
 
         res.send({
           success: true,
@@ -4145,55 +4967,263 @@ async function run() {
       }
     });
 
+    // Filters shared by the offline registrations endpoints.
+    // offlineFilter: every offline entry. entriesFilter: the table rows the requester may see.
+    const buildOfflineFilters = (req) => {
+      const isAdmin = req.user?.role === "admin";
+      // Same rule the page used client-side: typed offline, or carrying a paper serial
+      const offlineFilter = {
+        $or: [
+          { registration_type: "offline" },
+          { paper_serial_no: { $exists: true, $nin: [null, ""] } },
+          { offline_serial: { $exists: true, $nin: [null, ""] } },
+        ],
+      };
+      const requesterEmail = (req.decoded?.email || "").trim();
+      const entriesFilter = isAdmin
+        ? offlineFilter
+        : {
+            ...offlineFilter,
+            $or: [
+              { "created_by.email": requesterEmail.toLowerCase() },
+              { "created_by.email": requesterEmail },
+              { "created_by.email": { $regex: new RegExp(`^${requesterEmail}$`, "i") } },
+            ],
+          };
+      return { isAdmin, offlineFilter, entriesFilter };
+    };
+
+    // Aggregation equivalents of JS truthiness and `a || b || c`
+    const aggTruthy = (expr) => ({
+      $not: [{ $in: [{ $ifNull: [expr, null] }, [null, "", 0, false]] }],
+    });
+    const aggFirstTruthy = (...exprs) =>
+      exprs.reduceRight((fallback, expr) => ({ $cond: [aggTruthy(expr), expr, fallback] }));
+    const aggString = (expr) => ({ $convert: { input: expr, to: "string", onError: "", onNull: "" } });
+
     // Offline registrations page.
     // entries: full records for the table — every offline entry for admins, only their own for coordinators.
     // summary: every offline entry, stripped to the fields the summary cards need (no personal details).
     app.get('/offline-registrations', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
       try {
-        const isAdmin = req.user?.role === "admin";
-        // Same rule the page used client-side: typed offline, or carrying a paper serial
-        const offlineFilter = {
-          $or: [
-            { registration_type: "offline" },
-            { paper_serial_no: { $exists: true, $nin: [null, ""] } },
-            { offline_serial: { $exists: true, $nin: [null, ""] } },
-          ],
-        };
-        const requesterEmail = (req.decoded?.email || "").trim();
-        const entriesFilter = isAdmin
-          ? offlineFilter
-          : {
-              ...offlineFilter,
-              $or: [
-                { "created_by.email": requesterEmail.toLowerCase() },
-                { "created_by.email": requesterEmail },
-                { "created_by.email": { $regex: new RegExp(`^${requesterEmail}$`, "i") } },
-              ],
-            };
+        const { isAdmin, offlineFilter, entriesFilter } = buildOfflineFilters(req);
 
         const [entries, summary] = await Promise.all([
-          applicationCollection.find(entriesFilter).sort({ submittedAt: -1 }).toArray(),
+          // Table columns only (full records load from /registration-details/:id),
+          // keeping the response well under the hosting response-size limit
           applicationCollection
-            .find(offlineFilter)
-            .project({
-              _id: 1,
-              branch: 1,
-              sub_branch: 1,
-              reference: 1,
-              exam_center: 1,
-              reg_status: 1,
-              created_by: 1,
-              registration_type: 1,
-              paper_serial_no: 1,
-              offline_serial: 1,
-            })
+            .find(entriesFilter)
+            .sort({ submittedAt: -1 })
+            .project({ ...REGISTRATION_LIST_PROJECTION, delete_request: 1 })
             .toArray(),
+          // Admin entries already hold every offline entry, so the page builds its
+          // summary from them; only coordinators need the separate summary list
+          isAdmin
+            ? []
+            : applicationCollection
+                .find(offlineFilter)
+                .project({
+                  _id: 1,
+                  branch: 1,
+                  sub_branch: 1,
+                  reference: 1,
+                  exam_center: 1,
+                  reg_status: 1,
+                  created_by: 1,
+                  registration_type: 1,
+                  paper_serial_no: 1,
+                  offline_serial: 1,
+                })
+                .toArray(),
         ]);
 
         res.send({ entries, summary });
       } catch (err) {
         console.error("Error fetching offline registrations:", err);
         res.status(500).send({ message: "Failed to fetch offline registrations" });
+      }
+    });
+
+    // Offline registrations page — summary cards, chart and filter options as grouped counts.
+    // Groups keep raw values and first-seen order so the page applies its usual rules.
+    app.get('/offline-registrations/summary', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const { offlineFilter, entriesFilter } = buildOfflineFilters(req);
+        const coordinatorEmail = aggFirstTruthy("$created_by.email", "unknown");
+
+        // Groups in the order their first record appears: stored order for the cards
+        // (as the old summary list), table order — newest first — for the dropdowns
+        const STORED_ORDER = { _id: 1 };
+        const TABLE_ORDER = { submittedAt: -1, _id: -1 };
+        const firstOf = (sortBy, output) => ({ $top: { sortBy, output } });
+        const firstSeen = (sortBy, key, extra = {}) => {
+          const sortKeys = Object.keys(sortBy);
+          return [
+            {
+              $group: {
+                _id: key,
+                count: { $sum: 1 },
+                first: firstOf(sortBy, Object.fromEntries(sortKeys.map((k) => [k, `$${k}`]))),
+                ...extra,
+              },
+            },
+            { $sort: Object.fromEntries(sortKeys.map((k) => [`first.${k}`, sortBy[k]])) },
+          ];
+        };
+        const chartGroups = (sortBy) => firstSeen(sortBy, { email: "$created_by.email", name: "$created_by.name" });
+
+        const [[cards], [options]] = await Promise.all([
+          // Every offline entry
+          applicationCollection.aggregate([
+            { $match: offlineFilter },
+            { $project: { reg_status: 1, branch: 1, reference: 1, sub_branch: 1, exam_center: 1, created_by: 1 } },
+            {
+              $facet: {
+                statusCounts: firstSeen(STORED_ORDER, "$reg_status"),
+                branches: firstSeen(STORED_ORDER, aggFirstTruthy("$branch", "$reference", "unassigned")),
+                wards: [{ $match: { $expr: aggTruthy("$sub_branch") } }, ...firstSeen(STORED_ORDER, "$sub_branch")],
+                coordinators: firstSeen(STORED_ORDER, coordinatorEmail, {
+                  created_by: firstOf(STORED_ORDER, "$created_by"),
+                }),
+                centers: firstSeen(STORED_ORDER, "$exam_center"),
+                chartGroups: chartGroups(STORED_ORDER),
+              },
+            },
+          ]).toArray(),
+          // The requester's table rows
+          applicationCollection.aggregate([
+            { $match: entriesFilter },
+            { $project: { submittedAt: 1, branch: 1, reference: 1, sub_branch: 1, exam_center: 1, created_by: 1 } },
+            {
+              $facet: {
+                coordinatorOptions: firstSeen(TABLE_ORDER, coordinatorEmail, {
+                  name: firstOf(TABLE_ORDER, aggFirstTruthy("$created_by.name", coordinatorEmail)),
+                }),
+                examCenterOptions: [
+                  { $match: { $expr: aggTruthy("$exam_center") } },
+                  ...firstSeen(TABLE_ORDER, "$exam_center"),
+                ],
+                // Distinct values the search box matches by their Bangla labels
+                areaPairs: [{ $group: { _id: { branch: "$branch", sub_branch: "$sub_branch" } } }],
+                references: [{ $group: { _id: "$reference" } }],
+                chartGroups: chartGroups(TABLE_ORDER),
+              },
+            },
+          ]).toArray(),
+        ]);
+
+        const rows = (list = []) => list.map(({ _id, count, first, ...rest }) => ({ key: _id, count, ...rest }));
+        const chartRows = (list = []) =>
+          list.map(({ _id, count }) => ({ offline: true, created_by: { email: _id.email, name: _id.name }, count }));
+
+        res.send({
+          success: true,
+          statusCounts: rows(cards?.statusCounts),
+          branches: rows(cards?.branches),
+          wards: rows(cards?.wards),
+          coordinators: rows(cards?.coordinators).map(({ key, count, created_by }) => ({ email: key, count, created_by })),
+          centers: rows(cards?.centers),
+          chartGroups: chartRows(cards?.chartGroups),
+          // Used for the chart only when there are no offline entries at all, as before
+          entriesChartGroups: chartRows(options?.chartGroups),
+          coordinatorOptions: (options?.coordinatorOptions || []).map(({ _id, name }) => ({ email: _id, name })),
+          examCenterOptions: (options?.examCenterOptions || []).map(({ _id }) => _id),
+          areaPairs: (options?.areaPairs || []).map(({ _id }) => ({
+            branch: _id.branch ?? null,
+            sub_branch: _id.sub_branch ?? null,
+          })),
+          references: (options?.references || []).map(({ _id }) => _id ?? null),
+        });
+      } catch (err) {
+        console.error("Offline registrations summary error:", err);
+        res.status(500).send({ message: "Failed to load offline registrations summary" });
+      }
+    });
+
+    // Offline registrations page — one page of table rows, filtered and searched on the server
+    // with the same rules the page used to apply in the browser.
+    // POST because the label matches for search can be too long for a URL.
+    app.post('/offline-registrations/list', verifyToken, verifyCoordinatorOrAdmin, async (req, res) => {
+      try {
+        const { entriesFilter } = buildOfflineFilters(req);
+        const {
+          page = 1,
+          limit = 15,
+          branch = "all",
+          sub_branch = "all",
+          coordinator = "all",
+          center = "all",
+          q = "",
+          labelPairs = [],
+          labelRefs = [],
+        } = req.body || {};
+
+        const conditions = [entriesFilter];
+        if (branch !== "all") {
+          // (branch || reference || "unassigned") === selected
+          conditions.push({ $expr: { $eq: [aggFirstTruthy("$branch", "$reference", "unassigned"), branch] } });
+        }
+        if (sub_branch !== "all") {
+          conditions.push({ sub_branch });
+        }
+        if (coordinator !== "all") {
+          conditions.push({ $expr: { $eq: [aggFirstTruthy("$created_by.email", "unknown"), coordinator] } });
+        }
+        if (center !== "all") {
+          conditions.push({
+            $expr: { $eq: [{ $toLower: aggString(aggFirstTruthy("$exam_center", "")) }, String(center).toLowerCase()] },
+          });
+        }
+
+        const query = String(q || "").toLowerCase().trim();
+        if (query) {
+          const pattern = escapeRegex(query);
+          // Case-insensitive "contains" on lowercased fields, case-sensitive on roll/phone, as before
+          const contains = (expr, caseInsensitive = true) => ({
+            $expr: {
+              $regexMatch: { input: aggString(expr), regex: pattern, ...(caseInsensitive ? { options: "i" } : {}) },
+            },
+          });
+          const searchOr = [
+            contains(aggFirstTruthy("$offline_serial", "$paper_serial_no", "$form_number", "")),
+            contains(aggFirstTruthy("$name_en", "")),
+            contains(aggFirstTruthy("$name_bn", "")),
+            contains(aggFirstTruthy("$school_name", "")),
+            contains(aggFirstTruthy("$student_roll", ""), false),
+            contains(aggFirstTruthy("$phone_number", ""), false),
+            contains(aggFirstTruthy("$note", "")),
+          ];
+          // Thana / ward / reference labels matched in the browser, sent as raw values
+          if (Array.isArray(labelPairs)) {
+            labelPairs.slice(0, 2000).forEach((p) => {
+              searchOr.push({ branch: p?.branch ?? null, sub_branch: p?.sub_branch ?? null });
+            });
+          }
+          if (Array.isArray(labelRefs) && labelRefs.length > 0) {
+            searchOr.push({ reference: { $in: labelRefs.slice(0, 2000).map((r) => r ?? null) } });
+          }
+          conditions.push({ $or: searchOr });
+        }
+
+        const filter = { $and: conditions };
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 15));
+
+        const [entries, total] = await Promise.all([
+          applicationCollection
+            .find(filter)
+            .sort({ submittedAt: -1, _id: -1 })
+            .skip((pageNum - 1) * limitNum)
+            .limit(limitNum)
+            .project({ ...REGISTRATION_LIST_PROJECTION, delete_request: 1 })
+            .toArray(),
+          applicationCollection.countDocuments(filter),
+        ]);
+
+        res.send({ success: true, entries, total, page: pageNum, totalPages: Math.ceil(total / limitNum) });
+      } catch (err) {
+        console.error("Offline registrations list error:", err);
+        res.status(500).send({ message: "Failed to load offline registrations" });
       }
     });
 
